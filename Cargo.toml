@@ -1,0 +1,22 @@
+[package]
+name = "arbox"
+version = "0.2.0"
+edition = "2021"
+description = "Docker-based agent sandbox: a skinny chroot of the host for running coding agents alongside your normal workflow"
+authors = ["Jason Garber <jgarber@appcove.com>"]
+license = "Apache-2.0"
+repository = "https://github.com/appcove/arbox"
+homepage = "https://github.com/appcove/arbox"
+readme = "README.md"
+keywords = ["docker", "sandbox", "container", "claude", "codex"]
+categories = ["command-line-utilities", "development-tools"]
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+anyhow = "1"
+tempfile = "3"
+libc = "0.2"
+
+[profile.release]
+lto = "thin"
+strip = true
