@@ -2,7 +2,9 @@
 
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
 
-# Designed for Ubuntu Linux. Requires Docker.
+# Sandbox for Claude Code and Codex on Ubuntu Linux and Windows
+
+Docker-based agent sandbox. Supports Ubuntu Linux and Windows.
 
 ## LLM Produced Code Notice
 
@@ -18,10 +20,11 @@ to move to a full containerized development workflow just for sandbox
 support.
 
 The goal of this project is to make it easy to build a host-shaped Docker
-container with the same uid, gid, Ubuntu codename, Rust toolchain, and
-claude/codex setup (via mounts), and then make it equally easy to launch
-claude or codex inside that container with the current git repo mounted at
-the same absolute path.
+container with the same Rust toolchain and claude/codex setup (via mounts),
+and then make it equally easy to launch claude or codex inside that container
+with the current git repo mounted at the same absolute path. On Linux, the
+container mirrors the host's uid/gid and Ubuntu codename; on Windows, it
+mirrors the username and uses Git Bash for Unix-like shell behavior.
 
 ## About (LLM Generated)
 
@@ -29,11 +32,16 @@ A Docker-based agent sandbox for running Claude Code, Codex CLI, and
 arbitrary build commands with a narrower view of the host than a normal
 shell.
 
-`arbox` builds a per-host Ubuntu image from an embedded Dockerfile, mirrors
-your host uid/gid, bind-mounts the current git workspace at the same path,
-and runs the requested command as you. The point is fast re-entry into a
-host-shaped environment where edits still appear in your normal editor, but
-the agent sees only the explicit mounts.
+`arbox` builds a per-host image from embedded Dockerfiles:
+- On **Ubuntu/Linux**: builds from the host's Ubuntu codename (e.g., `ubuntu:jammy`),
+  mirrors your host uid/gid, and sets up a Unix-like environment.
+- On **Windows**: builds from Windows Server Core LTSC 2022, creates a user
+  matching the host username, and uses Git Bash as the default shell.
+
+In both cases, the workspace is bind-mounted at the same path, and the
+requested command runs as you. The point is fast re-entry into a host-shaped
+environment where edits still appear in your normal editor, but the agent
+sees only the explicit mounts.
 
 This is intentionally closer to a skinny chroot than to a hardened VM. It is
 useful against accidents, prompt injection, and many dependency-script
@@ -76,6 +84,8 @@ escape or host shell access.
 
 ## Requirements
 
+### Ubuntu Linux
+
 - **Ubuntu Linux** host. The image is built from your host's Ubuntu codename
   so libc and toolchain behavior line up with the host.
 - **Docker Engine** on `PATH`.
@@ -83,10 +93,24 @@ escape or host shell access.
   `~/.rustup` must exist before launching arbox.
 - **Git** on the host. The workspace is resolved via `git rev-parse
   --show-toplevel`.
+
+### Windows
+
+- **Windows 10/11 Pro** or **Windows Server 2022** (required for Hyper-V and Docker Desktop).
+- **Docker Desktop for Windows** on `PATH`, configured for Windows containers.
+- **[rustup](https://rustup.rs)** installed on the host. `%USERPROFILE%\.cargo` and
+  `%USERPROFILE%\.rustup` must exist before launching arbox.
+- **Git** on the host (typically bundled with Git Bash). The workspace is resolved via `git rev-parse
+  --show-toplevel`.
+- **Hyper-V** virtualization support enabled (required for Windows containers with `--isolation=hyperv`).
+
+### Both Platforms
+
 - For the AI clients: **Claude Code** and/or **Codex CLI** authenticated on
   the host. `arbox claude` checks for `~/.claude` and `~/.claude.json`;
   `arbox codex` checks for `~/.codex`. `arbox bash` and `arbox run` do not
   require agent config directories.
+  - **Windows note:** `.claude.json` is relayed through the mounted `~/.claude` directory since Docker on Windows doesn't support binding individual files.
 
 ## Install
 
@@ -112,18 +136,24 @@ arbox claude                       # Claude Code, project auto-mounted
 arbox codex                        # Codex CLI, project auto-mounted
 ```
 
-The first build can take a few minutes because the image installs common
-development packages plus uv and deno. Subsequent launches reuse the per-host
-image tag, which is `arbox:<ubuntu-codename>-uid<uid>-<dockerfile-hash>`.
+The first build can take a few minutes to download and install tools.
+Subsequent launches reuse the per-host cached image.
+
+**Image tags:**
+- **Linux:** `arbox:<ubuntu-codename>-uid<uid>-<dockerfile-hash>`
+  (e.g., `arbox:jammy-uid1000-a1b2c3d4`)
+- **Windows:** `arbox:windows-ltsc2022-<username>-<dockerfile-hash>`
+  (e.g., `arbox:windows-ltsc2022-alice-a1b2c3d4`)
+
 The Dockerfile-content hash is the trailing 8 hex chars; editing the
 embedded Dockerfile changes the hash, which makes the next launch verb
 notice the missing tag and rebuild automatically. `arbox clean` wipes every
 image with your host's prefix, including stale ones from earlier Dockerfile
 revisions.
 
-The Dockerfile is multi-arch via BuildKit's `TARGETARCH`. amd64 (x86_64) and
-arm64 (aarch64) hosts both work; other architectures fail the build with a
-clear message.
+On **Linux/Unix**, the Dockerfile is multi-arch via BuildKit's `TARGETARCH`.
+amd64 (x86_64) and arm64 (aarch64) hosts both work; other architectures fail
+the build with a clear message. On **Windows**, only amd64 is supported.
 
 ## Commands
 
@@ -160,12 +190,14 @@ Required to exist on the host; launches fail loudly if a path is missing.
 
 ## How it works
 
-1. `host::detect()` reads UID/GID, passwd username/home, current directory,
+### Linux/Unix Flow
+
+1. `HostContext::detect()` reads UID/GID, passwd username/home, current directory,
    `$TERM`, and `/etc/os-release`. It also tries to resolve the git toplevel
    and common dir, but tolerates failure so non-launch verbs work outside a
    repo.
-2. `host::require_supported_distro()` rejects non-Ubuntu hosts for now;
-   launch verbs additionally call `host::require_git()` to demand a workspace.
+2. `host::require_supported_distro()` verifies Ubuntu; launch verbs additionally
+   call `host::require_git()` to demand a workspace.
 3. `image::ensure_built()` derives the image tag from the host codename, uid,
    and an 8-char hash of the embedded Dockerfile bytes
    (`arbox:<codename>-uid<uid>-<hash>`). When the Dockerfile changes, the tag
@@ -183,18 +215,52 @@ Required to exist on the host; launches fail loudly if a path is missing.
    the selected command with host-shaped paths and inherited stdio. `-t` is
    added only when stdin is an interactive terminal.
 
+### Windows Flow
+
+1. Similar to Linux, but `HostContext::detect()` reads the Windows username and home directory
+   from the registry (`GetUserProfileDirectory`). It detects Windows OS version
+   and skips Unix-specific fields (UID/GID/codename).
+2. Image tag is derived as `arbox:windows-ltsc2022-<username>-<dockerfile-hash>`.
+3. The Windows Dockerfile starts from `mcr.microsoft.com/windows/servercore:ltsc2022`,
+   installs Git, ripgrep, fd, bat, and other development tools via PowerShell,
+   creates the container user with local administrator privileges, and configures
+   Git Bash as the default shell.
+4. A PowerShell entrypoint script (`entrypoint.ps1`) is embedded in the image. It:
+   - Relays `.claude.json` credentials through the mounted `~/.claude` directory
+     (workaround for Docker on Windows not supporting individual file binds)
+   - Routes commands intelligently: executable paths and Windows commands run directly,
+     bash built-ins and Unix utilities run through Git Bash
+5. `docker run --rm -i --isolation=hyperv --workdir <cwd>` runs the command with
+   Hyper-V isolation. `-t` is added only when stdin is a real TTY. Windows containers
+   use NAT networking, so `--network host` is not used.
+
 ## Customization
 
 Most behavior is controlled by what's on your host:
+
+### Linux/Unix
 
 - The image follows your host's Ubuntu codename from `/etc/os-release`.
 - The container user and home directory come from `getpwuid_r`, not from
   `$USER` or `$HOME`.
 - The current directory selects the git workspace to mount.
-- Editing `src/Dockerfile` invalidates the cached image tag automatically;
+- Editing `src/Dockerfile.ubuntu` invalidates the cached image tag automatically;
   the next launch verb rebuilds with no extra flags. `arbox build --force`
   is only needed when you want to rebuild without changing the Dockerfile
   (e.g. to refresh apt mirrors).
+
+### Windows
+
+- The image always uses Windows Server Core LTSC 2022 as the base.
+- The container user is created with the same username as the host.
+- Editing `src/Dockerfile.windows` or `src/entrypoint.ps1` invalidates the
+  cached image tag automatically; the next launch verb rebuilds.
+- Tool versions (Git, ripgrep, fd, bat) are pinned in the Windows Dockerfile
+  and can be updated by changing the ARG values.
+
+### Both Platforms
+
+- The current directory selects the git workspace to mount.
 - Add ad-hoc directories with `--rw`/`--ro` per-invocation; permanent
   additions belong in `launch::mount_specs`.
 
@@ -207,8 +273,10 @@ cargo clippy --all-targets -- -D warnings
 cargo fmt --check
 ```
 
-The unit tests do not require Docker. End-to-end behavior requires an Ubuntu
-host with Docker and the expected host config directories.
+The unit tests do not require Docker. End-to-end behavior requires:
+- **Linux:** an Ubuntu host with Docker and the expected host config directories
+- **Windows:** a Windows host with Docker Desktop configured for Windows containers
+  and the expected host config directories (`%USERPROFILE%\.claude`, etc.)
 
 ## Contributing
 

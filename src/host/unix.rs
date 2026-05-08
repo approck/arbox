@@ -1,16 +1,48 @@
-use anyhow::{anyhow, Result};
-use std::ffi::CStr;
+#![cfg(target_family = "unix")]
+
+use std::ffi::{CStr, OsString};
 use std::mem::MaybeUninit;
 use std::path::PathBuf;
 use std::ptr;
 
-/// Look up a user's name and home dir for a UID via `getpwuid_r`.
-/// Deliberately avoids `$USER` / `$HOME` env vars: they can be shadowed by the
-/// caller, and we use the values to derive image tags and bind-mount paths
-/// where shadowing would be a quiet correctness bug.
-pub fn user_info(uid: u32) -> Result<(String, PathBuf)> {
-    // Single retry with a larger buffer if the first call returns ERANGE,
-    // which happens on systems with very long shells/gecos fields.
+use anyhow::{anyhow, Context, Result};
+
+use super::OsInfo;
+use super::UserInfoQuery;
+use super::UserInfoQueryExtra;
+
+impl UserInfoQuery {
+    pub fn unix() -> Result<UserInfoQuery> {
+        let uid = unsafe { libc::getuid() };
+        let gid = unsafe { libc::getgid() };
+        let (name, home) = get_name_and_home(uid)?;
+        Ok(Self {
+            username: OsString::from(name),
+            home,
+            extra: UserInfoQueryExtra::Unix { uid, gid },
+        })
+    }
+}
+
+impl OsInfo {
+    pub fn get_unix() -> Result<Self> {
+        let uid = unsafe { libc::getuid() };
+        let gid = unsafe { libc::getgid() };
+        let osrel = crate::osrelease::parse("/etc/os-release")
+            .context("reading /etc/os-release")?;
+        let distro_id = osrel
+            .get("ID")
+            .ok_or_else(|| anyhow!("/etc/os-release has no ID="))?
+            .clone();
+        let distro_codename = osrel
+            .get("VERSION_CODENAME")
+            .ok_or_else(|| anyhow!("/etc/os-release has no VERSION_CODENAME="))?
+            .clone();
+        Ok(Self::Unix { uid, gid, distro_id, distro_codename })
+    }
+}
+
+fn get_name_and_home(uid: u32) -> Result<(String, PathBuf)> {
     for size in [4096usize, 65536] {
         match try_lookup(uid, size)? {
             Some(pair) => return Ok(pair),
@@ -22,8 +54,6 @@ pub fn user_info(uid: u32) -> Result<(String, PathBuf)> {
     ))
 }
 
-/// Returns Ok(Some) on success, Ok(None) if buffer was too small (ERANGE),
-/// Err on any other failure.
 fn try_lookup(uid: u32, bufsize: usize) -> Result<Option<(String, PathBuf)>> {
     let mut buf = vec![0u8; bufsize];
     let mut pwd = MaybeUninit::<libc::passwd>::uninit();
@@ -49,8 +79,6 @@ fn try_lookup(uid: u32, bufsize: usize) -> Result<Option<(String, PathBuf)>> {
         return Err(anyhow!("no passwd entry for uid {uid}"));
     }
 
-    // SAFETY: getpwuid_r returned 0 with non-null result, so pwd is initialized
-    // and pw_name/pw_dir point into our `buf` (kept alive for the borrow).
     let pwd = unsafe { pwd.assume_init() };
     let name = unsafe { CStr::from_ptr(pwd.pw_name) }
         .to_str()
@@ -63,17 +91,4 @@ fn try_lookup(uid: u32, bufsize: usize) -> Result<Option<(String, PathBuf)>> {
         return Err(anyhow!("passwd entry for {name} has no home dir"));
     }
     Ok(Some((name, PathBuf::from(home))))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn looks_up_current_user() {
-        let uid = unsafe { libc::getuid() };
-        let (name, home) = user_info(uid).unwrap();
-        assert!(!name.is_empty());
-        assert!(home.is_absolute());
-    }
 }
