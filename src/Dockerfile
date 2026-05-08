@@ -22,8 +22,22 @@ ARG TARGETARCH
 
 ENV DEBIAN_FRONTEND=noninteractive
 
+# Apt package set, grouped by purpose:
+#   - C/C++ build drivers + linkers: build-essential pkg-config clang
+#     libclang-dev cmake mold (clang+libclang-dev are required by bindgen-
+#     based crates; cmake/mold cover *-sys crates and faster linking).
+#   - System libraries most non-trivial Rust crates link against: openssl,
+#     sqlite, postgres, zlib, lzma.
+#   - protobuf-compiler for tonic/prost.
+#   - gdb for debugging.
+#   - The rest are agent ergonomics: shells, search tools, network tools,
+#     wayland-clipboard for image paste, python + uv (later) for PEP-723
+#     scripts.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-      build-essential pkg-config libssl-dev \
+      build-essential pkg-config clang libclang-dev cmake mold \
+      libssl-dev libsqlite3-dev libpq-dev zlib1g-dev liblzma-dev \
+      protobuf-compiler \
+      gdb \
       ca-certificates curl git git-lfs \
       vim nano less sudo jq unzip zip xz-utils \
       ripgrep fd-find bat tree tmux shellcheck \
