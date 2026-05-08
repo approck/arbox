@@ -1,0 +1,64 @@
+# escape=`
+FROM mcr.microsoft.com/windows/servercore:ltsc2022
+
+ENV ARBOX_INSIDE=1
+
+ARG HOST_USER=developer
+
+ARG GIT_VERSION=2.54.0
+RUN powershell -NoProfile -Command `
+    $v = [System.Environment]::GetEnvironmentVariable('GIT_VERSION'); `
+    $url = 'https://github.com/git-for-windows/git/releases/download/v' + $v + '.windows.1/Git-' + $v + '-64-bit.exe'; `
+    Invoke-WebRequest -Uri $url -OutFile C:\git_installer.exe; `
+    & C:\git_installer.exe /VERYSILENT /NORESTART /NOCANCEL /SP-; `
+    Remove-Item C:\git_installer.exe
+
+RUN powershell -NoProfile -Command New-Item -ItemType Directory -Force C:\tools\bin
+
+ARG RG_VERSION=15.1.0
+RUN powershell -NoProfile -Command `
+    $v = [System.Environment]::GetEnvironmentVariable('RG_VERSION'); `
+    $name = 'ripgrep-' + $v + '-x86_64-pc-windows-msvc'; `
+    $url = 'https://github.com/BurntSushi/ripgrep/releases/download/' + $v + '/' + $name + '.zip'; `
+    Invoke-WebRequest -Uri $url -OutFile C:\tools\rg.zip; `
+    Expand-Archive C:\tools\rg.zip -DestinationPath C:\tools\rg_tmp; `
+    Move-Item ('C:\tools\rg_tmp\' + $name + '\rg.exe') C:\tools\bin\rg.exe; `
+    Remove-Item -Recurse C:\tools\rg.zip, C:\tools\rg_tmp
+
+ARG FD_VERSION=10.4.2
+RUN powershell -NoProfile -Command `
+    $v = [System.Environment]::GetEnvironmentVariable('FD_VERSION'); `
+    $name = 'fd-v' + $v + '-x86_64-pc-windows-msvc'; `
+    $url = 'https://github.com/sharkdp/fd/releases/download/v' + $v + '/' + $name + '.zip'; `
+    Invoke-WebRequest -Uri $url -OutFile C:\tools\fd.zip; `
+    Expand-Archive C:\tools\fd.zip -DestinationPath C:\tools\fd_tmp; `
+    Move-Item ('C:\tools\fd_tmp\' + $name + '\fd.exe') C:\tools\bin\fd.exe; `
+    Remove-Item -Recurse C:\tools\fd.zip, C:\tools\fd_tmp
+
+ARG BAT_VERSION=0.26.1
+RUN powershell -NoProfile -Command `
+    $v = [System.Environment]::GetEnvironmentVariable('BAT_VERSION'); `
+    $name = 'bat-v' + $v + '-x86_64-pc-windows-msvc'; `
+    $url = 'https://github.com/sharkdp/bat/releases/download/v' + $v + '/' + $name + '.zip'; `
+    Invoke-WebRequest -Uri $url -OutFile C:\tools\bat.zip; `
+    Expand-Archive C:\tools\bat.zip -DestinationPath C:\tools\bat_tmp; `
+    Move-Item ('C:\tools\bat_tmp\' + $name + '\bat.exe') C:\tools\bin\bat.exe; `
+    Remove-Item -Recurse C:\tools\bat.zip, C:\tools\bat_tmp
+
+RUN powershell -NoProfile -Command `
+    $user = [System.Environment]::GetEnvironmentVariable('HOST_USER'); `
+    net user $user /add /active:yes /expires:never; `
+    net localgroup Administrators $user /add
+
+# Entrypoint: stages .claude.json via the mounted .claude directory.
+# Docker on Windows doesn't support binding individual files, so we relay credentials
+# through the mounted .claude/ directory: the entrypoint copies .claude/.claude.json
+# to $HOME/.claude.json at startup and syncs changes back on exit. Rust then copies
+# .claude/.claude.json back to the host .claude.json, completing the round-trip.
+RUN powershell -NoProfile -Command New-Item -ItemType Directory -Force C:\arbox
+COPY entrypoint.ps1 C:\arbox\entrypoint.ps1
+
+USER ${HOST_USER}
+WORKDIR C:\Users\${HOST_USER}
+ENTRYPOINT ["C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe", "-NoProfile", "-File", "C:\\arbox\\entrypoint.ps1"]
+CMD ["C:\\Program Files\\Git\\bin\\bash.exe", "-l"]

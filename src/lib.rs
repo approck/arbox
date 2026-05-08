@@ -4,4 +4,3 @@ pub mod host;
 pub mod image;
 pub mod launch;
 pub mod osrelease;
-pub mod passwd;

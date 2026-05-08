@@ -2,8 +2,9 @@ use anyhow::{bail, Context, Result};
 use std::hash::{DefaultHasher, Hasher};
 use std::process::{Command, Stdio};
 
-use crate::dockerfile::DOCKERFILE;
-use crate::host::{self, HostContext};
+use crate::dockerfile::{DOCKERFILE_UBUNTU, DOCKERFILE_WINDOWS, ENTRYPOINT_PS1};
+use crate::host::{self, HostContext, OsInfo};
+use crate::host::UserInfo;
 
 /// 8-hex-char fingerprint of the embedded Dockerfile bytes. Mixed into the
 /// image tag so that editing the Dockerfile (different package list, bumped
@@ -12,22 +13,35 @@ use crate::host::{self, HostContext};
 /// "did the bytes change" check.
 fn dockerfile_hash() -> String {
     let mut h = DefaultHasher::new();
-    h.write(DOCKERFILE.as_bytes());
+    h.write(DOCKERFILE_UBUNTU.as_bytes());
     format!("{:08x}", h.finish() as u32)
 }
 
-/// Tag prefix shared by every arbox image for the current host (codename +
-/// uid). Used by `clean` to wipe stale images when the Dockerfile-hash
-/// changes.
-pub fn tag_prefix(host: &HostContext) -> String {
-    format!("arbox:{}-uid{}-", host.distro_codename, host.uid)
-}
+impl HostContext {
+    /// Tag prefix shared by every arbox image for the current host (codename +
+    /// uid). Used by `clean` to wipe stale images when the Dockerfile-hash
+    /// changes.
+    pub fn tag_prefix(&self) -> String {
+        let username = match &self.user {
+            UserInfo::Unix { username, .. } | UserInfo::Windows { username } => username,
+        };
+        match &self.os {
+            OsInfo::Unix { uid, distro_codename, .. } => {
+                format!("arbox:{}-uid{}-", distro_codename, uid)
+            }
+            OsInfo::Windows { .. } => format!(
+                "arbox:windows-ltsc2022-{}-",
+                username.display()
+            ),
+        }
+    }
 
-/// `arbox:<distro_codename>-uid<uid>-<dockerfile_hash>`. Two users on the
-/// same machine, two machines on different Ubuntu releases, or two builds
-/// of different Dockerfiles all get distinct tags.
-pub fn tag(host: &HostContext) -> String {
-    format!("{}{}", tag_prefix(host), dockerfile_hash())
+    /// `arbox:<distro_codename>-uid<uid>-<dockerfile_hash>`. Two users on the
+    /// same machine, two machines on different Ubuntu releases, or two builds
+    /// of different Dockerfiles all get distinct tags.
+    pub fn tag(self: &HostContext) -> String {
+        format!("{}{}", self.tag_prefix(), dockerfile_hash())
+    }
 }
 
 pub fn image_exists(tag: &str) -> Result<bool> {
@@ -43,7 +57,7 @@ pub fn image_exists(tag: &str) -> Result<bool> {
 /// Build the image if it isn't already present. Used by every launch verb so
 /// the first invocation on a fresh host self-bootstraps.
 pub fn ensure_built(host: &HostContext) -> Result<String> {
-    let t = tag(host);
+    let t = host.tag();
     if image_exists(&t)? {
         return Ok(t);
     }
@@ -56,9 +70,9 @@ pub fn ensure_built(host: &HostContext) -> Result<String> {
 }
 
 pub fn build_image(force: bool, no_cache: bool) -> Result<()> {
-    let host = host::detect()?;
+    let host = HostContext::detect()?;
     host::require_supported_distro(&host)?;
-    let t = tag(&host);
+    let t = host.tag();
     if force && image_exists(&t)? {
         eprintln!("[arbox] removing existing image {t} before rebuild");
         let status = Command::new("docker")
@@ -77,43 +91,84 @@ pub fn build_image(force: bool, no_cache: bool) -> Result<()> {
 fn build_with_args(host: &HostContext, t: &str, no_cache: bool) -> Result<()> {
     let dir = tempfile::tempdir().context("creating build context tempdir")?;
     let dockerfile_path = dir.path().join("Dockerfile");
-    std::fs::write(&dockerfile_path, DOCKERFILE)
-        .with_context(|| format!("writing {}", dockerfile_path.display()))?;
 
-    let mut cmd = Command::new("docker");
-    cmd.arg("build")
-        .arg("--tag")
-        .arg(t)
-        .arg("--build-arg")
-        .arg(format!("HOST_DISTRO_CODENAME={}", host.distro_codename))
-        .arg("--build-arg")
-        .arg(format!("HOST_UID={}", host.uid))
-        .arg("--build-arg")
-        .arg(format!("HOST_GID={}", host.gid))
-        .arg("--build-arg")
-        .arg(format!("HOST_USER={}", host.username))
-        .arg("--build-arg")
-        .arg(format!("HOST_HOME={}", host.home.display()));
-    if no_cache {
-        cmd.arg("--no-cache");
-    }
-    cmd.arg("-f").arg(&dockerfile_path);
-    cmd.arg(dir.path());
-    cmd.stdout(Stdio::inherit()).stderr(Stdio::inherit());
+    match &host.os {
+        OsInfo::Unix { uid, gid, distro_codename, .. } => {
+            let username = match &host.user {
+                UserInfo::Unix { username, .. } => username,
+                _ => unreachable!(),
+            };
+            std::fs::write(&dockerfile_path, DOCKERFILE_UBUNTU)
+                .with_context(|| format!("writing {}", dockerfile_path.display()))?;
 
-    let status = cmd.status().context("running `docker build`")?;
-    if !status.success() {
-        bail!("docker build failed with {status}");
+            let mut cmd = Command::new("docker");
+            cmd.arg("build")
+                .arg("--tag")
+                .arg(t)
+                .arg("--build-arg")
+                .arg(format!("HOST_DISTRO_CODENAME={}", distro_codename))
+                .arg("--build-arg")
+                .arg(format!("HOST_UID={}", uid))
+                .arg("--build-arg")
+                .arg(format!("HOST_GID={}", gid))
+                .arg("--build-arg")
+                .arg(format!("HOST_USER={}", username.display()))
+                .arg("--build-arg")
+                .arg(format!("HOST_HOME={}", host.home.display()));
+            if no_cache {
+                cmd.arg("--no-cache");
+            }
+            cmd.arg("-f").arg(&dockerfile_path);
+            cmd.arg(dir.path());
+            cmd.stdout(Stdio::inherit()).stderr(Stdio::inherit());
+
+            let status = cmd.status().context("running `docker build`")?;
+            if !status.success() {
+                bail!("docker build failed with {status}");
+            }
+            Ok(())
+        }
+        OsInfo::Windows { .. } => {
+            let username = match &host.user {
+                UserInfo::Windows { username } => username,
+                _ => unreachable!(),
+            };
+            std::fs::write(&dockerfile_path, DOCKERFILE_WINDOWS)
+                .with_context(|| format!("writing {}", dockerfile_path.display()))?;
+
+            let entrypoint_path = dir.path().join("entrypoint.ps1");
+            std::fs::write(&entrypoint_path, ENTRYPOINT_PS1)
+                .with_context(|| format!("writing {}", entrypoint_path.display()))?;
+
+            let mut cmd = Command::new("docker");
+            cmd.arg("build")
+                .arg("--isolation=hyperv")
+                .arg("--tag")
+                .arg(t)
+                .arg("--build-arg")
+                .arg(format!("HOST_USER={}", username.display()));
+            if no_cache {
+                cmd.arg("--no-cache");
+            }
+            cmd.arg("-f").arg(&dockerfile_path);
+            cmd.arg(dir.path());
+            cmd.stdout(Stdio::inherit()).stderr(Stdio::inherit());
+
+            let status = cmd.status().context("running `docker build`")?;
+            if !status.success() {
+                bail!("docker build failed with {status}");
+            }
+            Ok(())
+        }
     }
-    Ok(())
 }
 
 /// Remove every arbox image for the current host. This includes the
 /// currently-tagged image and any stale ones from earlier Dockerfile
 /// revisions (whose tags differ only in the dockerfile_hash suffix).
 pub fn clean() -> Result<()> {
-    let host = host::detect()?;
-    let prefix = tag_prefix(&host);
+    let host = HostContext::detect()?;
+    let prefix = host.tag_prefix();
 
     let listing = Command::new("docker")
         .args(["images", "--format", "{{.Repository}}:{{.Tag}}", "arbox"])
@@ -159,7 +214,7 @@ pub fn clean() -> Result<()> {
 
 pub fn print_status() -> Result<()> {
     // Always print whatever we managed to detect, even on unsupported hosts.
-    let host = match host::detect() {
+    let host = match HostContext::detect() {
         Ok(h) => h,
         Err(e) => {
             println!("host detection failed: {e:#}");
@@ -167,49 +222,14 @@ pub fn print_status() -> Result<()> {
         }
     };
 
-    println!("host:");
-    println!("  uid:                {}", host.uid);
-    println!("  gid:                {}", host.gid);
-    println!("  username:           {}", host.username);
-    println!("  home:               {}", host.home.display());
-    println!(
-        "  distro:             {} {}",
-        host.distro_id, host.distro_codename
-    );
-    match &host.workspace_root {
-        Some(w) => println!("  workspace root:     {}", w.display()),
-        None => println!("  workspace root:     (not in a git repository)"),
-    }
-    if let Some(c) = &host.git_common_dir {
-        if !c.starts_with(host.workspace_root.as_deref().unwrap_or(&host.cwd)) {
-            println!("  git common dir:     {} (worktree)", c.display());
-        }
-    }
-    println!("  cwd:                {}", host.cwd.display());
-    println!("  term:               {}", host.term);
-
-    if host.distro_id != "ubuntu" {
-        println!();
-        println!(
-            "unsupported distro: {} (arbox supports ubuntu only)",
-            host.distro_id
-        );
-        return Ok(());
-    }
+    println!("{host}");
 
     println!("mounts (host == container path):");
-    for m in crate::launch::mount_specs(&host) {
-        let mode = if m.read_only { "ro" } else { "rw" };
-        let exists = m.path.exists();
-        let suffix = match (exists, m.required) {
-            (true, _) => "",
-            (false, true) => "  [missing — required]",
-            (false, false) => "  [missing — skipped]",
-        };
-        println!("  {} ({mode}){suffix}", m.path.display());
+    for m in host.mount_specs() {
+        println!("{m}");
     }
 
-    let t = tag(&host);
+    let t = host.tag();
     println!("image:");
     if image_exists(&t)? {
         println!("  tag:    {t}");
