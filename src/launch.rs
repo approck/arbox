@@ -234,7 +234,9 @@ fn run(
     }
     // Distinctive uppercase hostname — `jason@ARBOX:~$` makes it obvious at
     // a glance that you're inside the sandbox shell vs. the host shell.
-    cmd.args(["--hostname", "ARBOX", "--network", "host"]);
+    // Adding `--add-host ARBOX:127.0.0.1` ensures that sudo inside the container
+    // can resolve its own hostname without throwing warnings.
+    cmd.args(["--hostname", "ARBOX", "--network", "host", "--add-host", "ARBOX:127.0.0.1"]);
     // /dev/shm defaults to 64 MB in Docker, which is enough to crash Chromium
     // on any non-trivial page. Bump it once here so every Playwright test
     // doesn't have to remember --disable-dev-shm-usage.
