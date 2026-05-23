@@ -1,2 +1,7 @@
 /target
 Cargo.lock.bak
+
+# Agent dotfiles created when running these tools against the arbox repo itself
+.claude/
+.codex/
+.antigravitycli/

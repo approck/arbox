@@ -54,6 +54,15 @@ enum Cmd {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
+    /// Run Google Antigravity's `agy` CLI inside the sandbox. Requires
+    /// `~/.local/bin/agy` on the host (install with:
+    /// `curl -fsSL https://antigravity.google/cli/install.sh | bash`).
+    /// First-time auth uses agy's SSH-style URL+code flow because libsecret
+    /// isn't available inside the container. All trailing args forwarded.
+    Agy {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
     /// Drop into an interactive bash login shell inside the sandbox.
     Bash,
     /// Run the Playwright CLI inside the sandbox (image ships node +
@@ -118,6 +127,7 @@ fn dispatch(cmd: Cmd, rw: Vec<PathBuf>, ro: Vec<PathBuf>) -> Result<ExitCode> {
     match cmd {
         Cmd::Claude { args } => launch::run_claude(args, rw, ro),
         Cmd::Codex { args } => launch::run_codex(args, rw, ro),
+        Cmd::Agy { args } => launch::run_agy(args, rw, ro),
         Cmd::Bash => launch::run_bash(rw, ro),
         Cmd::Playwright { args } => launch::run_playwright(args, rw, ro),
         Cmd::Run { cmd } => launch::run_argv(cmd, rw, ro),

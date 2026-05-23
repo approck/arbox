@@ -75,6 +75,14 @@ pub fn mount_specs(host: &HostContext) -> Vec<MountSpec> {
         // makes claude's credentials persist across container invocations.
         MountSpec::new(h.join(".claude.json"), false, false, None),
         MountSpec::new(h.join(".codex"), false, false, None),
+        // Antigravity (`agy`) stores its skills, MCP config, and global
+        // GEMINI.md under ~/.gemini (yes — the Antigravity CLI reuses the
+        // Gemini namespace). Per-host config is under ~/.config/antigravity.
+        // Both mounted RW so first-run setup and `/skills` / `/mcp` edits
+        // persist across container invocations. Optional — `arbox bash`
+        // and `arbox run` don't need them.
+        MountSpec::new(h.join(".gemini"), false, false, None),
+        MountSpec::new(h.join(".config").join("antigravity"), false, false, None),
         // Host's ~/.gitconfig (read-only). So git inside the container picks
         // up the user's identity, aliases, signing config, etc. Skipped if
         // absent on the host.
@@ -114,6 +122,11 @@ fn require_agent_dotfiles(host: &HostContext, agent: &str) -> Result<()> {
             host.home.join(".codex"),
             "run `codex` once on the host to authenticate first",
         )][..],
+        "agy" => &[(
+            "~/.local/bin/agy",
+            host.home.join(".local").join("bin").join("agy"),
+            "install Antigravity CLI on the host: curl -fsSL https://antigravity.google/cli/install.sh | bash",
+        )][..],
         _ => &[][..],
     };
     for (label, path, hint) in needs {
@@ -146,6 +159,20 @@ pub fn run_codex(extra: Vec<String>, rw: Vec<PathBuf>, ro: Vec<PathBuf>) -> Resu
         "codex".to_string(),
         "--dangerously-bypass-approvals-and-sandbox".to_string(),
     ];
+    argv.extend(extra);
+    run(host, argv, rw, ro)
+}
+
+pub fn run_agy(extra: Vec<String>, rw: Vec<PathBuf>, ro: Vec<PathBuf>) -> Result<ExitCode> {
+    let host = host::detect()?;
+    host::require_git(&host)?;
+    require_agent_dotfiles(&host, "agy")?;
+    // No documented `--dangerously-*` / `--yolo` flag for Antigravity yet —
+    // forward args verbatim. The Docker boundary is still the sandbox; agy
+    // itself just runs with whatever approval mode it defaults to. Note
+    // that libsecret won't work inside the container (no dbus session), so
+    // first-time auth typically goes through agy's SSH-style URL+code flow.
+    let mut argv = vec!["agy".to_string()];
     argv.extend(extra);
     run(host, argv, rw, ro)
 }

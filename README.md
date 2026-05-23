@@ -137,6 +137,7 @@ clear message.
 |---------------------------------|-------------|
 | `arbox claude [FLAGS] -- ARGS...` | Run Claude Code with `--dangerously-skip-permissions`. |
 | `arbox codex  [FLAGS] -- ARGS...` | Run Codex CLI with `--dangerously-bypass-approvals-and-sandbox`. |
+| `arbox agy    [FLAGS] -- ARGS...` | Run Google Antigravity's `agy` CLI. Binary comes from host `~/.local/bin/agy`; first-time auth uses agy's SSH-style URL+code flow since libsecret isn't reachable inside the container. |
 | `arbox bash   [FLAGS]`          | Open an interactive login bash inside the container. |
 | `arbox playwright [FLAGS] -- ARGS...` | Run the Playwright CLI (`test`, `codegen`, `show-report`, …). Image ships Node + Playwright + chromium + firefox. |
 | `arbox run    [FLAGS] -- CMD...`  | Run a one-off command inside the container. |
@@ -146,13 +147,13 @@ clear message.
 | `arbox status`                  | Show host facts, mount layout, image presence, and network mode. Works outside a git repository (skips the workspace mount in that case). |
 | `arbox clean`                   | Remove every arbox image whose tag has the current host's prefix. |
 
-`claude`, `codex`, `bash`, and `run` must be invoked from inside a git
-repository — they mount the git toplevel as the workspace and `cd` into your
-current directory. `status`, `build`, and `clean` do not require a repo.
+`claude`, `codex`, `agy`, `bash`, and `run` must be invoked from inside a
+git repository — they mount the git toplevel as the workspace and `cd` into
+your current directory. `status`, `build`, and `clean` do not require a repo.
 
 ### Extra bind-mount flags
 
-`claude`, `codex`, `bash`, and `run` accept zero or more `--rw <PATH>` and
+`claude`, `codex`, `agy`, `bash`, and `run` accept zero or more `--rw <PATH>` and
 `--ro <PATH>` options. Each path is canonicalized (relative paths and
 symlinks resolve against the host filesystem) and mounted at the same
 absolute path inside the container.
