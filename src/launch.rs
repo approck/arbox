@@ -150,6 +150,17 @@ pub fn run_codex(extra: Vec<String>, rw: Vec<PathBuf>, ro: Vec<PathBuf>) -> Resu
     run(host, argv, rw, ro)
 }
 
+pub fn run_playwright(extra: Vec<String>, rw: Vec<PathBuf>, ro: Vec<PathBuf>) -> Result<ExitCode> {
+    let host = host::detect()?;
+    host::require_git(&host)?;
+    // `playwright` is npm-installed globally in the image. Browsers are
+    // baked in at /opt/ms-playwright (PLAYWRIGHT_BROWSERS_PATH set in the
+    // Dockerfile), so this works without any host-side setup.
+    let mut argv = vec!["playwright".to_string()];
+    argv.extend(extra);
+    run(host, argv, rw, ro)
+}
+
 pub fn run_bash(rw: Vec<PathBuf>, ro: Vec<PathBuf>) -> Result<ExitCode> {
     let host = host::detect()?;
     host::require_git(&host)?;
@@ -197,6 +208,10 @@ fn run(
     // Distinctive uppercase hostname — `jason@ARBOX:~$` makes it obvious at
     // a glance that you're inside the sandbox shell vs. the host shell.
     cmd.args(["--hostname", "ARBOX", "--network", "host"]);
+    // /dev/shm defaults to 64 MB in Docker, which is enough to crash Chromium
+    // on any non-trivial page. Bump it once here so every Playwright test
+    // doesn't have to remember --disable-dev-shm-usage.
+    cmd.args(["--shm-size", "1g"]);
     cmd.arg("--user").arg(format!("{}:{}", host.uid, host.gid));
     cmd.arg("--workdir").arg(&host.cwd);
     cmd.arg("-e").arg(format!("HOME={}", host.home.display()));

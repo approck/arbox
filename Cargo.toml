@@ -1,6 +1,6 @@
 [package]
 name = "arbox"
-version = "0.2.3"
+version = "0.2.4-beta"
 edition = "2021"
 description = "Docker-based agent sandbox: a skinny chroot of the host for running coding agents alongside your normal workflow"
 authors = ["Jason Garber <jgarber@appcove.com>"]

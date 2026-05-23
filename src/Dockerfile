@@ -44,6 +44,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
       dnsutils iputils-ping \
       wl-clipboard \
       python3 python3-venv python3-pip \
+      libnss3 libatk1.0-0 libatk-bridge2.0-0 libcups2 libxkbcommon0 \
+      libxcomposite1 libxdamage1 libxfixes3 libxrandr2 libgbm1 \
+      libpango-1.0-0 libcairo2 libasound2t64 libatspi2.0-0 libxshmfence1 \
+      fonts-liberation fonts-noto-color-emoji \
     && rm -rf /var/lib/apt/lists/*
 
 # Debian/Ubuntu rename `fd` -> `fdfind` and `bat` -> `batcat` to avoid name
@@ -84,6 +88,33 @@ RUN ARCH=$(case "${TARGETARCH}" in \
  && install -m 0755 /tmp/deno /usr/local/bin/deno \
  && rm -f /tmp/deno.zip /tmp/deno
 
+# Node.js (LTS, pinned). Mirrors the uv/deno pattern: versioned tarball
+# from the canonical distribution, no `curl | sh` against a moving install
+# script. Override NODE_VERSION at build time to bump.
+ARG NODE_VERSION=20.18.1
+RUN ARCH=$(case "${TARGETARCH}" in \
+        amd64) echo x64 ;; \
+        arm64) echo arm64 ;; \
+        *)     echo "" ;; \
+    esac) \
+ && [ -n "${ARCH}" ] || { echo "arbox: unsupported TARGETARCH=${TARGETARCH}" >&2; exit 1; } \
+ && curl -fsSL "https://nodejs.org/dist/v${NODE_VERSION}/node-v${NODE_VERSION}-linux-${ARCH}.tar.xz" \
+      -o /tmp/node.tar.xz \
+ && tar -xJf /tmp/node.tar.xz -C /usr/local --strip-components=1 \
+ && rm -f /tmp/node.tar.xz
+
+# Playwright (pinned) plus its bundled Chromium and Firefox baked into the
+# image at /opt/ms-playwright. WebKit deliberately skipped — its system
+# library list is larger and changes more often. Override PLAYWRIGHT_VERSION
+# at build time to bump.
+ARG PLAYWRIGHT_VERSION=1.49.0
+ENV PLAYWRIGHT_BROWSERS_PATH=/opt/ms-playwright
+RUN npm install -g \
+      "playwright@${PLAYWRIGHT_VERSION}" \
+      "@playwright/test@${PLAYWRIGHT_VERSION}" \
+ && playwright install chromium firefox \
+ && chmod -R a+rX /opt/ms-playwright
+
 # Mirror the host user/group exactly.
 # Most ubuntu:<codename> base images ship a default user at uid 1000;
 # rename that entry instead of failing on conflict.
@@ -108,6 +139,11 @@ ENV PATH=${HOST_HOME}/.cargo/bin:${HOST_HOME}/.local/bin:/usr/local/bin:/usr/bin
 # Marker so the host-side `arbox` binary refuses to run inside its own
 # container (where there's no `docker` to talk to anyway).
 ENV ARBOX_INSIDE=1
+
+# Stop Claude Code's background autoupdater check inside the sandbox.
+# Neither autoupdate nor `claude update`/`claude install` will work in here
+# anyway — upgrade Claude Code on the host, outside of arbox.
+ENV DISABLE_AUTOUPDATER=1
 
 USER ${HOST_USER}
 WORKDIR ${HOST_HOME}

@@ -67,6 +67,9 @@ or a process that you intentionally gave access to your mounted credentials.
 - **The container uses host networking** (`--network host`) because coding
   agents and package managers often need normal network behavior. Do not
   treat the network as isolated.
+- **`/dev/shm` is bumped to 1 GB.** Docker's 64 MB default crashes Chromium
+  on non-trivial pages; the bump removes the need for
+  `--disable-dev-shm-usage` on every Playwright launch.
 - **Inside the container, agents run with `--dangerously-skip-permissions` /
   `--dangerously-bypass-approvals-and-sandbox`.** This is intentional: the
   Docker boundary and explicit mount list are the sandbox.
@@ -115,7 +118,8 @@ arbox codex                        # Codex CLI, project auto-mounted
 ```
 
 The first build can take a few minutes because the image installs common
-development packages plus uv and deno. Subsequent launches reuse the per-host
+development packages plus uv, deno, Node, and Playwright with chromium +
+firefox baked in (~700 MB just for the browsers). Subsequent launches reuse the per-host
 image tag, which is `arbox:<ubuntu-codename>-uid<uid>-<dockerfile-hash>`.
 The Dockerfile-content hash is the trailing 8 hex chars; editing the
 embedded Dockerfile changes the hash, which makes the next launch verb
@@ -134,6 +138,7 @@ clear message.
 | `arbox claude [FLAGS] -- ARGS...` | Run Claude Code with `--dangerously-skip-permissions`. |
 | `arbox codex  [FLAGS] -- ARGS...` | Run Codex CLI with `--dangerously-bypass-approvals-and-sandbox`. |
 | `arbox bash   [FLAGS]`          | Open an interactive login bash inside the container. |
+| `arbox playwright [FLAGS] -- ARGS...` | Run the Playwright CLI (`test`, `codegen`, `show-report`, …). Image ships Node + Playwright + chromium + firefox. |
 | `arbox run    [FLAGS] -- CMD...`  | Run a one-off command inside the container. |
 | `arbox build`                   | Build the host-specific Docker image. |
 | `arbox build --force`           | Remove the existing image tag before rebuilding. |
