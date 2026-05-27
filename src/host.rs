@@ -26,9 +26,8 @@ pub struct HostContext {
 }
 
 pub fn detect() -> Result<HostContext> {
-    // SAFETY: getuid/getgid never fail.
-    let uid = unsafe { libc::getuid() };
-    let gid = unsafe { libc::getgid() };
+    let uid = get_uid();
+    let gid = get_gid();
 
     let (username, home) = passwd::user_info(uid)
         .with_context(|| format!("could not resolve passwd entry for uid {uid}"))?;
@@ -38,15 +37,20 @@ pub fn detect() -> Result<HostContext> {
         .canonicalize()
         .context("canonicalizing cwd")?;
 
-    let osrel = osrelease::parse("/etc/os-release").context("reading /etc/os-release")?;
-    let distro_id = osrel
-        .get("ID")
-        .ok_or_else(|| anyhow!("/etc/os-release has no ID="))?
-        .clone();
-    let distro_codename = osrel
-        .get("VERSION_CODENAME")
-        .ok_or_else(|| anyhow!("/etc/os-release has no VERSION_CODENAME="))?
-        .clone();
+    let (distro_id, distro_codename) = if cfg!(target_family = "unix") {
+        let osrel = osrelease::parse("/etc/os-release").context("reading /etc/os-release")?;
+        let distro_id = osrel
+            .get("ID")
+            .ok_or_else(|| anyhow!("/etc/os-release has no ID="))?
+            .clone();
+        let distro_codename = osrel
+            .get("VERSION_CODENAME")
+            .ok_or_else(|| anyhow!("/etc/os-release has no VERSION_CODENAME="))?
+            .clone();
+        (distro_id, distro_codename)
+    } else {
+        ("ubuntu".to_string(), "noble".to_string())
+    };
 
     let term = std::env::var("TERM").unwrap_or_else(|_| "xterm-256color".to_string());
 
@@ -109,4 +113,24 @@ pub fn require_git<'a>(host: &'a HostContext) -> Result<(&'a Path, &'a Path)> {
         );
     }
     Ok((workspace, common))
+}
+
+#[cfg(target_family = "unix")]
+fn get_uid() -> u32 {
+    unsafe { libc::getuid() }
+}
+
+#[cfg(target_family = "windows")]
+fn get_uid() -> u32 {
+    1000
+}
+
+#[cfg(target_family = "unix")]
+fn get_gid() -> u32 {
+    unsafe { libc::getgid() }
+}
+
+#[cfg(target_family = "windows")]
+fn get_gid() -> u32 {
+    1000
 }

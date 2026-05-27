@@ -115,18 +115,22 @@ pub fn mount_specs(host: &HostContext, profile: Option<&str>) -> Vec<MountSpec> 
         }
     }
 
-    specs.push(MountSpec::new(
-        h.join(".cargo"),
-        false,
-        true,
-        Some("install rustup on the host first (https://rustup.rs)"),
-    ));
-    specs.push(MountSpec::new(
-        h.join(".rustup"),
-        true,
-        true,
-        Some("install rustup on the host first (https://rustup.rs)"),
-    ));
+    if !cfg!(target_family = "windows") {
+        specs.extend([
+            MountSpec::new(
+                h.join(".cargo"),
+                false,
+                true,
+                Some("install rustup on the host first (https://rustup.rs)"),
+            ),
+            MountSpec::new(
+                h.join(".rustup"),
+                true,
+                true,
+                Some("install rustup on the host first (https://rustup.rs)"),
+            ),
+        ]);
+    }
 
     // Agent state dirs/files — mounted RW and optional. `ensure_agent_state`
     // pre-creates the relevant sources on first launch of each agent verb, so
@@ -151,13 +155,83 @@ pub fn mount_specs(host: &HostContext, profile: Option<&str>) -> Vec<MountSpec> 
     // subscription, so it stays shared across profiles. Skipped if absent.
     specs.push(MountSpec::new(h.join(".gitconfig"), true, false, None));
 
-    // Deliberately NOT mounted: ~/.local/bin and ~/.local/share/claude. Those
-    // hold the host's own agent BINARIES — arbox runs the versions baked into
+    // Optional: user's local bin (still useful for non-agent tools the
+    // user keeps there). Read-only so the in-container agents can't
+    // shadow themselves with stale host copies.
+    specs.push(MountSpec::new(h.join(".local").join("bin"), true, false, None));
+    specs.push(MountSpec::new(
+        h.join(".local").join("share").join("claude"),
+        true,
+        false,
+        None,
+    ));
+
+    // Deliberately NOT mounted: ~/.local/bin and ~/.local/share/claude when NOT in profile mode
+    // as they hold the host's own agent BINARIES — arbox runs the versions baked into
     // the image instead (bumped via `arbox update`), so mounting the host
     // copies would only let them shadow the baked binary on PATH (the exact
     // staleness bug this avoids). All agent DATA lives in the state paths above.
 
     specs
+}
+
+/// On Windows, fix git worktree paths so they resolve correctly in the
+/// container. The `.git` file in a worktree contains an absolute Windows path
+/// that doesn't work inside the container. Replace it with a relative path
+/// and add the container path to git's safe.directory. Returns the container
+/// path if one was added (for cleanup on exit).
+fn fixup_windows_worktree(host: &HostContext) -> Result<Option<String>> {
+    if !cfg!(target_family = "windows") {
+        return Ok(None);
+    }
+
+    let Some(workspace) = &host.workspace_root else {
+        return Ok(None);
+    };
+
+    let git_file = workspace.join(".git");
+    // Check if .git is a file (worktree) vs directory (normal checkout)
+    if !git_file.is_file() {
+        return Ok(None);
+    }
+
+    let git_content = std::fs::read_to_string(&git_file).context("reading .git file")?;
+
+    let Some(git_dir) = git_content
+        .lines()
+        .find_map(|l| l.strip_prefix("gitdir: "))
+        .map(|path| PathBuf::from(path).canonicalize())
+        .transpose()?
+    else {
+        return Ok(None);
+    };
+
+    // Calculate relative path from worktree to the git common dir
+    if let Some(rel_path) = pathdiff::diff_paths(git_dir, workspace) {
+        let rel_str = rel_path.to_string_lossy().replace("\\", "/");
+        let new_content = format!("gitdir: {}\n", rel_str);
+
+        if git_content != new_content {
+            std::fs::write(&git_file, &new_content)
+                .context("writing .git file with relative path")?;
+        }
+
+        // Add the container path to git's safe.directory
+        let container_path = crate::path::to_wsl(workspace);
+        let mut cmd = Command::new("git");
+        cmd.args([
+            "config",
+            "--global",
+            "--add",
+            "safe.directory",
+            &container_path,
+        ]);
+        let _ = cmd.status(); // Ignore errors; this is best-effort
+
+        return Ok(Some(container_path));
+    }
+
+    Ok(None)
 }
 
 /// Pre-create the host-side state paths an agent will write into, so the
@@ -327,6 +401,7 @@ fn ensure_all_agent_state(host: &HostContext, profile: Option<&str>) -> Result<(
 fn run(host: HostContext, argv: Vec<String>, opts: Opts) -> Result<ExitCode> {
     ensure_docker_installed()?;
     host::require_supported_distro(&host)?;
+    let added_safe_dir = fixup_windows_worktree(&host)?;
     let mut mounts = mount_specs(&host, opts.profile.as_deref());
     append_extra_mounts(&mut mounts, &opts.rw, false)?;
     append_extra_mounts(&mut mounts, &opts.ro, true)?;
@@ -353,26 +428,45 @@ fn run(host: HostContext, argv: Vec<String>, opts: Opts) -> Result<ExitCode> {
     // doesn't have to remember --disable-dev-shm-usage.
     cmd.args(["--shm-size", "1g"]);
     cmd.arg("--user").arg(format!("{}:{}", host.uid, host.gid));
-    cmd.arg("--workdir").arg(&host.cwd);
-    cmd.arg("-e").arg(format!("HOME={}", host.home.display()));
+
+    if cfg!(target_family = "windows") {
+        cmd.arg("--workdir").arg(crate::path::to_wsl(&host.cwd));
+        cmd.arg("-e")
+            .arg(format!("HOME={}", crate::path::to_wsl(&host.home)));
+    } else {
+        cmd.arg("--workdir").arg(&host.cwd);
+        cmd.arg("-e").arg(format!("HOME={}", host.home.display()));
+    }
+
     cmd.arg("-e").arg(format!("USER={}", host.username));
     cmd.arg("-e").arg(format!("TERM={}", host.term));
     cmd.arg("-e").arg("LANG=C.UTF-8");
+    if let Ok(key) = std::env::var("ANTHROPIC_API_KEY") {
+        cmd.arg("-e").arg(format!("ANTHROPIC_API_KEY={key}"));
+    }
 
     for m in &mounts {
         if !m.src.exists() {
             // Optional + missing: skip. Required + missing was caught above.
             continue;
         }
-        let arg = if m.read_only {
-            format!(
-                "type=bind,src={},dst={},readonly",
-                m.src.display(),
-                m.dst.display()
-            )
+
+        let mut arg = if cfg!(target_family = "windows") {
+            const PREFIX: &str = r#"\\?\"#;
+
+            let mut src: &str = &m.src.to_string_lossy();
+            src = src.strip_prefix(PREFIX).unwrap_or(src);
+            let dst = crate::path::to_wsl(&m.dst);
+
+            format!("type=bind,src={src},dst={dst}")
         } else {
             format!("type=bind,src={},dst={}", m.src.display(), m.dst.display())
         };
+
+        if m.read_only {
+            arg.push_str(",readonly");
+        }
+
         cmd.arg("--mount").arg(arg);
     }
 
@@ -389,6 +483,19 @@ fn run(host: HostContext, argv: Vec<String>, opts: Opts) -> Result<ExitCode> {
         .stderr(Stdio::inherit())
         .status()
         .context("running `docker run`")?;
+
+    // Clean up Windows worktree safe.directory entry after container exits
+    if let Some(safe_dir_path) = added_safe_dir {
+        let mut cleanup_cmd = Command::new("git");
+        cleanup_cmd.args([
+            "config",
+            "--global",
+            "--unset",
+            "safe.directory",
+            &safe_dir_path,
+        ]);
+        let _ = cleanup_cmd.status(); // Ignore errors; this is best-effort
+    }
 
     Ok(match status.code() {
         Some(c) if (0..=255).contains(&c) => ExitCode::from(c as u8),
