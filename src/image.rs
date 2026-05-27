@@ -80,6 +80,12 @@ fn build_with_args(host: &HostContext, t: &str, no_cache: bool) -> Result<()> {
     std::fs::write(&dockerfile_path, DOCKERFILE)
         .with_context(|| format!("writing {}", dockerfile_path.display()))?;
 
+    let home_str = if cfg!(target_family = "windows") {
+        crate::path::to_wsl(&host.home)
+    } else {
+        host.home.display().to_string()
+    };
+
     let mut cmd = Command::new("docker");
     cmd.arg("build")
         .arg("--tag")
@@ -93,7 +99,15 @@ fn build_with_args(host: &HostContext, t: &str, no_cache: bool) -> Result<()> {
         .arg("--build-arg")
         .arg(format!("HOST_USER={}", host.username))
         .arg("--build-arg")
-        .arg(format!("HOST_HOME={}", host.home.display()));
+        .arg(format!("HOST_HOME={}", home_str));
+    if cfg!(target_family = "windows") {
+        cmd.args(["--build-arg", "WINDOWS_HOST=true"])
+            .args(["--build-arg", "CARGO_HOME=/usr/local/cargo"])
+            .args(["--build-arg", "RUSTUP_HOME=/usr/local/rustup"]);
+    } else {
+        cmd.args(["--build-arg", "CARGO_HOME=/root/.cargo"])
+            .args(["--build-arg", "RUSTUP_HOME=/root/.rustup"]);
+    }
     if no_cache {
         cmd.arg("--no-cache");
     }

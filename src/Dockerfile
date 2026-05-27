@@ -160,26 +160,43 @@ RUN mkdir -p /tmp/grok-stage \
  && chmod +x /usr/local/bin/grok \
  && rm -rf /tmp/grok-stage /tmp/grok-install.sh
 
+ARG WINDOWS_HOST=false
 # Mirror the host user/group exactly.
 # Most ubuntu:<codename> base images ship a default user at uid 1000;
 # rename that entry instead of failing on conflict.
-RUN if getent group ${HOST_GID} >/dev/null; then \
-        groupmod -n ${HOST_USER} $(getent group ${HOST_GID} | cut -d: -f1); \
-    else \
-        groupadd -g ${HOST_GID} ${HOST_USER}; \
-    fi && \
-    if getent passwd ${HOST_UID} >/dev/null; then \
-        usermod -l ${HOST_USER} -d ${HOST_HOME} -m -g ${HOST_GID} \
-          $(getent passwd ${HOST_UID} | cut -d: -f1); \
-    else \
-        useradd -u ${HOST_UID} -g ${HOST_GID} -d ${HOST_HOME} -m -s /bin/bash ${HOST_USER}; \
-    fi && \
-    echo "${HOST_USER} ALL=(ALL) NOPASSWD: ALL" > /etc/sudoers.d/${HOST_USER} && \
-    chmod 440 /etc/sudoers.d/${HOST_USER}
+# Skipped for windows.
+RUN if [ "${WINDOWS_HOST}" = "false" ]; then \
+      if getent group ${HOST_GID} >/dev/null; then \
+          groupmod -n ${HOST_USER} $(getent group ${HOST_GID} | cut -d: -f1); \
+      else \
+          groupadd -g ${HOST_GID} ${HOST_USER}; \
+      fi && \
+      if getent passwd ${HOST_UID} >/dev/null; then \
+          usermod -l ${HOST_USER} -d ${HOST_HOME} -m -g ${HOST_GID} \
+            $(getent passwd ${HOST_UID} | cut -d: -f1); \
+      else \
+          useradd -u ${HOST_UID} -g ${HOST_GID} -d ${HOST_HOME} -m -s /bin/bash ${HOST_USER}; \
+      fi && \
+      echo "${HOST_USER} ALL=(ALL) NOPASSWD: ALL" > /etc/sudoers.d/${HOST_USER} && \
+      chmod 440 /etc/sudoers.d/${HOST_USER}; \
+    fi
 
-# Toolchain comes from runtime mounts of ${HOST_HOME}/.cargo and
-# ${HOST_HOME}/.rustup; nothing rust-related is baked into the image.
-ENV PATH=${HOST_HOME}/.cargo/bin:${HOST_HOME}/.local/bin:/usr/local/bin:/usr/bin:/bin
+# Rust toolchain: conditionally baked into the image for Windows hosts,
+# or mounted from the host for native Linux/Unix hosts.
+# On Windows, install rustup inside the container. On Linux, mount host ~/.cargo/.rustup.
+ARG CARGO_HOME=/root/.cargo
+ARG RUSTUP_HOME=/root/.rustup
+ENV CARGO_HOME=${CARGO_HOME}
+ENV RUSTUP_HOME=${RUSTUP_HOME}
+RUN if [ "${WINDOWS_HOST}" = "true" ]; then \
+      curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable && \
+      chmod -R 777 /usr/local/cargo /usr/local/rustup; \
+    fi
+
+# Set up PATH: include both container-installed (Windows) and host-mounted (Linux) paths.
+# Windows: /usr/local/cargo/bin is used (set via CARGO_HOME above).
+# Linux: host's ${HOST_HOME}/.cargo/bin is mounted and used.
+ENV PATH=/usr/local/cargo/bin:/root/.cargo/bin:${HOST_HOME}/.cargo/bin:${HOST_HOME}/.local/bin:/usr/local/bin:/usr/bin:/bin
 
 # Marker so the host-side `arbox` binary refuses to run inside its own
 # container (where there's no `docker` to talk to anyway).
