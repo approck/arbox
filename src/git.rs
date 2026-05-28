@@ -20,7 +20,14 @@ pub fn toplevel(dir: &Path) -> Result<PathBuf> {
         .context("git toplevel is not utf-8")?
         .trim()
         .to_string();
-    Ok(PathBuf::from(s).canonicalize()?)
+
+    let path = if cfg!(target_family = "windows") {
+        PathBuf::from(s).canonicalize()?
+    } else {
+        PathBuf::from(s)
+    };
+
+    Ok(path)
 }
 
 /// Resolve the **common** git dir — the one that holds objects, refs, etc.
