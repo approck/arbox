@@ -122,6 +122,8 @@ fn get_uid() -> u32 {
 
 #[cfg(target_family = "windows")]
 fn get_uid() -> u32 {
+    // Windows has no Unix-style uid system. Return 1000, a standard default uid
+    // for Linux container environments that this tool mirrors users into.
     1000
 }
 
@@ -132,5 +134,7 @@ fn get_gid() -> u32 {
 
 #[cfg(target_family = "windows")]
 fn get_gid() -> u32 {
+    // Windows has no Unix-style gid system. Return 1000, a standard default gid
+    // for Linux container environments that this tool mirrors users into.
     1000
 }

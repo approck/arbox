@@ -247,6 +247,12 @@ git config --global --unset safe.directory /mnt/c/Users/<username>/path/to/workt
 git config --global --unset-all safe.directory
 ```
 
+### User ID/Group ID
+
+On Windows, arbox uses a hardcoded UID and GID of `1000` for container processes, since Windows does not have Unix-style user and group IDs. This value is a standard default for the first non-root user in Linux container environments.
+
+Files created inside the container will appear to be owned by UID/GID 1000 in the container, but on the Windows host they are owned by your Windows user account as expected. This allows the container to function as a normal Linux environment while keeping host file ownership correct.
+
 ## How it works
 
 1. `host::detect()` reads UID/GID, passwd username/home, current directory,
