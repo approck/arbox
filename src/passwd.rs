@@ -9,6 +9,3 @@ mod windows;
 
 #[cfg(target_family = "windows")]
 pub use windows::user_info;
-
-// #[cfg(target_family = "windows")]
-// pub fn user_info(uid: u32) -> Result<(String, PathBuf)> {}
