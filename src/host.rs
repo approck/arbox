@@ -37,20 +37,7 @@ pub fn detect() -> Result<HostContext> {
         .canonicalize()
         .context("canonicalizing cwd")?;
 
-    let (distro_id, distro_codename) = if cfg!(target_family = "unix") {
-        let osrel = osrelease::parse("/etc/os-release").context("reading /etc/os-release")?;
-        let distro_id = osrel
-            .get("ID")
-            .ok_or_else(|| anyhow!("/etc/os-release has no ID="))?
-            .clone();
-        let distro_codename = osrel
-            .get("VERSION_CODENAME")
-            .ok_or_else(|| anyhow!("/etc/os-release has no VERSION_CODENAME="))?
-            .clone();
-        (distro_id, distro_codename)
-    } else {
-        ("ubuntu".to_string(), "noble".to_string())
-    };
+    let (distro_id, distro_codename) = get_distro()?;
 
     let term = std::env::var("TERM").unwrap_or_else(|_| "xterm-256color".to_string());
 
@@ -137,4 +124,23 @@ fn get_gid() -> u32 {
     // Windows has no Unix-style gid system. Return 1000, a standard default gid
     // for Linux container environments that this tool mirrors users into.
     1000
+}
+
+#[cfg(target_family = "unix")]
+fn get_distro() -> Result<(String, String)> {
+    let osrel = osrelease::parse("/etc/os-release").context("reading /etc/os-release")?;
+    let id = osrel
+        .get("ID")
+        .ok_or_else(|| anyhow!("/etc/os-release has no ID="))?
+        .clone();
+    let codename = osrel
+        .get("VERSION_CODENAME")
+        .ok_or_else(|| anyhow!("/etc/os-release has no VERSION_CODENAME="))?
+        .clone();
+    Ok((id, codename))
+}
+
+#[cfg(target_family = "windows")]
+fn get_distro() -> Result<(String, String)> {
+    Ok(("ubuntu".to_string(), "noble".to_string()))
 }
