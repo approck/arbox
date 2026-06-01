@@ -19,12 +19,14 @@ fn get_username() -> anyhow::Result<OsString> {
         fn GetUserNameW(lpBuffer: *mut u16, pcbBuffer: *mut u32) -> i32;
     }
 
+    const SIZE: u32 = 256;
+
     unsafe {
-        let mut buf: Vec<u16> = vec![0; 256];
-        let mut size: u32 = buf.len() as u32;
+        let mut buf: Vec<u16> = vec![0u16; SIZE as usize];
+        let mut size: u32 = SIZE;
 
         if GetUserNameW(buf.as_mut_ptr(), &mut size) != 0 {
-            let len = (size.saturating_sub(1)) as usize;
+            let len = usize::try_from(size.saturating_sub(1))?;
             let name = OsString::from_wide(&buf[..len]);
             Ok(name)
         } else {

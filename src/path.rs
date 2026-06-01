@@ -12,8 +12,9 @@ pub fn to_wsl(path: impl AsRef<Path>) -> String {
 
     // Convert Windows drive letter to WSL format
     if p.len() > 1 && p.chars().nth(1) == Some(':') {
-        let drive = p.chars().next().unwrap().to_ascii_lowercase();
-        p = format!("/mnt/{}{}", drive, &p[2..].replace('\\', "/"));
+        if let Some(drive) = p.chars().next() {
+            p = format!("/mnt/{}{}", drive.to_ascii_lowercase(), &p[2..].replace('\\', "/"));
+        }
     }
 
     p
