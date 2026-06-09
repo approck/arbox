@@ -1,9 +1,25 @@
 use anyhow::{bail, Context, Result};
 use std::hash::{DefaultHasher, Hasher};
 use std::process::{Command, Stdio};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::dockerfile::DOCKERFILE;
 use crate::host::{self, HostContext};
+
+/// How aggressively `docker build` should bypass its layer cache.
+#[derive(Clone, Copy)]
+enum BuildMode {
+    /// Plain cached build — used by the auto-bootstrap on first launch. The
+    /// agents come out at whatever version the cached layers already hold.
+    Cached,
+    /// Cached build, but pass a fresh `AGENT_REFRESH` token so the four agent
+    /// layers (and only those) re-run and pull their latest versions. Every
+    /// expensive layer above the cache-bust barrier stays cached.
+    RefreshAgents,
+    /// `--no-cache`: re-run every layer from scratch (apt, node, the
+    /// Playwright browser downloads, everything).
+    Full,
+}
 
 /// 8-hex-char fingerprint of the embedded Dockerfile bytes. Mixed into the
 /// image tag so that editing the Dockerfile (different package list, bumped
@@ -48,33 +64,44 @@ pub fn ensure_built(host: &HostContext) -> Result<String> {
         return Ok(t);
     }
     eprintln!("[arbox] image {t} not found — building from embedded Dockerfile…");
-    build_with_args(host, &t, false)?;
+    build_with_args(host, &t, BuildMode::Cached)?;
     if !image_exists(&t)? {
         bail!("docker build completed but image {t} is still missing");
     }
     Ok(t)
 }
 
-pub fn build_image(force: bool, no_cache: bool) -> Result<()> {
+/// Refresh the baked-in agents (claude, codex, agy, grok) to their latest
+/// published versions by rebuilding the image's agent layers in place.
+///
+/// The image keeps the same tag, so launch verbs pick up the refreshed agents
+/// automatically. By default only the agent layers re-run (a fresh
+/// `AGENT_REFRESH` cache-bust token is passed to `docker build`); `full`
+/// re-runs every layer from scratch with `--no-cache`.
+pub fn update_image(full: bool) -> Result<()> {
     let host = host::detect()?;
     host::require_supported_distro(&host)?;
     let t = tag(&host);
-    if force && image_exists(&t)? {
-        eprintln!("[arbox] removing existing image {t} before rebuild");
-        let status = Command::new("docker")
-            .args(["rmi", &t])
-            .stdout(Stdio::inherit())
-            .stderr(Stdio::inherit())
-            .status()
-            .context("running `docker rmi` for --force")?;
-        if !status.success() {
-            bail!("docker rmi failed with {status}");
-        }
+    if full {
+        eprintln!("[arbox] full rebuild of {t} (--no-cache)…");
+        build_with_args(&host, &t, BuildMode::Full)
+    } else {
+        eprintln!("[arbox] refreshing agents in {t} to their latest versions…");
+        build_with_args(&host, &t, BuildMode::RefreshAgents)
     }
-    build_with_args(&host, &t, no_cache)
 }
 
-fn build_with_args(host: &HostContext, t: &str, no_cache: bool) -> Result<()> {
+/// Seconds since the Unix epoch, used as the `AGENT_REFRESH` cache-bust token.
+/// Any value distinct from the previous build invalidates the agent layers; a
+/// monotonically-increasing timestamp guarantees that.
+fn refresh_token() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+fn build_with_args(host: &HostContext, t: &str, mode: BuildMode) -> Result<()> {
     let dir = tempfile::tempdir().context("creating build context tempdir")?;
     let dockerfile_path = dir.path().join("Dockerfile");
     std::fs::write(&dockerfile_path, DOCKERFILE)
@@ -94,8 +121,15 @@ fn build_with_args(host: &HostContext, t: &str, no_cache: bool) -> Result<()> {
         .arg(format!("HOST_USER={}", host.username))
         .arg("--build-arg")
         .arg(format!("HOST_HOME={}", host.home.display()));
-    if no_cache {
-        cmd.arg("--no-cache");
+    match mode {
+        BuildMode::Cached => {}
+        BuildMode::RefreshAgents => {
+            cmd.arg("--build-arg")
+                .arg(format!("AGENT_REFRESH={}", refresh_token()));
+        }
+        BuildMode::Full => {
+            cmd.arg("--no-cache");
+        }
     }
     cmd.arg("-f").arg(&dockerfile_path);
     cmd.arg(dir.path());
@@ -216,7 +250,7 @@ pub fn print_status() -> Result<()> {
         println!("  status: present");
     } else {
         println!("  tag:    {t}");
-        println!("  status: not built — run `arbox build` (or any launch verb) to build it");
+        println!("  status: not built — run `arbox update` (or any launch verb) to build it");
     }
     println!("network: host");
     Ok(())

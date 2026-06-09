@@ -52,15 +52,17 @@ or a process that you intentionally gave access to your mounted credentials.
   config, and installed command shims shared with the host, but it also means
   a compromised process can modify files under `~/.cargo`, including
   `~/.cargo/bin`. Treat this as a convenience tradeoff, not a hard boundary.
-- **`~/.claude`, `~/.claude.json`, and `~/.codex` are mounted read-write** so
-  credentials and state survive container rebuilds. A compromised agent could
-  modify these.
 - **Host `~/.gitconfig` is mounted read-only** when present, so git inside
   the container picks up your identity, aliases, and signing config.
-- **`~/.local/bin` and `~/.local/share/claude` are mounted read-only when
-  they exist.** The coding-agent binaries themselves come from the image
-  (claude, codex, agy, grok all baked in), so these mounts are now purely
-  for any other host-installed tools you keep under `~/.local/bin`.
+- **`~/.local/bin` and `~/.local/share/claude` are deliberately NOT mounted.**
+  Those hold the host's own agent binaries and claude version store; arbox
+  runs the claude/codex/agy/grok versions baked into the image (bumped with
+  `arbox update`), so mounting the host copies would only let them shadow the
+  baked binaries on `PATH`. Only agent *state* is shared — see the next bullet.
+- **Agent data dirs are mounted read-write** so config, credentials, history,
+  memories, and sessions persist across container rebuilds: `~/.claude` +
+  `~/.claude.json` (claude), `~/.codex`, `~/.gemini` + `~/.config/antigravity`
+  (agy), and `~/.grok`. A compromised agent could modify these.
 - **The host Wayland display socket is mounted when available** so
   `wl-paste` works for clipboard image flows. Only the socket file is
   mounted, not the full `$XDG_RUNTIME_DIR`.
@@ -114,7 +116,7 @@ This drops `arbox` into `~/.cargo/bin`. Make sure that's on your `PATH`.
 ```bash
 cd ~/code/some-rust-project
 arbox status                       # inspect detected host facts and mounts
-arbox build                        # optional; launch commands auto-build too
+arbox update                       # refresh agents to latest; auto-builds if missing
 arbox bash                         # interactive bash, project auto-mounted
 arbox run -- cargo test            # one-off command
 arbox claude                       # Claude Code, project auto-mounted
@@ -149,15 +151,14 @@ clear message.
 | `arbox bash   [FLAGS]`          | Open an interactive login bash inside the container. |
 | `arbox playwright [FLAGS] -- ARGS...` | Run the Playwright CLI (`test`, `codegen`, `show-report`, …). Image ships Node + Playwright + chromium + firefox. |
 | `arbox run    [FLAGS] -- CMD...`  | Run a one-off command inside the container. |
-| `arbox build`                   | Build the host-specific Docker image. |
-| `arbox build --force`           | Remove the existing image tag before rebuilding. |
-| `arbox build --no-cache`        | Pass `--no-cache` to `docker build`. |
+| `arbox update`                  | Refresh the baked-in agents (claude, codex, agy, grok) to their latest published versions, rebuilding only the agent layers (quick — the apt/node/playwright layers stay cached). Builds the image from scratch if it doesn't exist yet. |
+| `arbox update --force`          | Full clean rebuild of the entire image (`--no-cache`): re-runs apt, node, the Playwright browser downloads, everything. |
 | `arbox status`                  | Show host facts, mount layout, image presence, and network mode. Works outside a git repository (skips the workspace mount in that case). |
 | `arbox clean`                   | Remove every arbox image whose tag has the current host's prefix. |
 
 `claude`, `codex`, `agy`, `grok`, `bash`, and `run` must be invoked from
 inside a git repository — they mount the git toplevel as the workspace and
-`cd` into your current directory. `status`, `build`, and `clean` do not
+`cd` into your current directory. `status`, `update`, and `clean` do not
 require a repo.
 
 ### Extra bind-mount flags
@@ -190,11 +191,14 @@ Required to exist on the host; launches fail loudly if a path is missing.
    the next launch.
 4. The Dockerfile starts from `ubuntu:<host-codename>`, installs common
    development tools plus pinned uv and deno binaries (architecture chosen
-   from BuildKit's `TARGETARCH`), mirrors the host user/group, and puts
-   `~/.cargo/bin`, `~/.local/bin`, and system bins on `PATH`.
+   from BuildKit's `TARGETARCH`), bakes in the coding agents, mirrors the
+   host user/group, and orders `PATH` so `/usr/local/bin` (the baked agents)
+   wins over the host-mounted `~/.local/bin` — while `~/.cargo/bin` stays
+   first for the rustup shims.
 5. `launch::mount_specs()` builds the explicit bind-mount list for the
-   workspace, git worktree metadata, Rust toolchain, agent credentials, and
-   optional local client installs. User-supplied `--rw`/`--ro` paths are
+   workspace, git worktree metadata, Rust toolchain, and agent state dirs
+   (config, credentials, history, sessions). Agent *binaries* are never
+   mounted — they come from the image. User-supplied `--rw`/`--ro` paths are
    appended after canonicalization.
 6. `docker run --rm -i --network host --user UID:GID --workdir <cwd>` runs
    the selected command with host-shaped paths and inherited stdio. `-t` is
@@ -209,9 +213,14 @@ Most behavior is controlled by what's on your host:
   `$USER` or `$HOME`.
 - The current directory selects the git workspace to mount.
 - Editing `src/Dockerfile` invalidates the cached image tag automatically;
-  the next launch verb rebuilds with no extra flags. `arbox build --force`
-  is only needed when you want to rebuild without changing the Dockerfile
-  (e.g. to refresh apt mirrors).
+  the next launch verb rebuilds with no extra flags.
+- The agents (claude, codex, agy, grok) are pinned to `@latest` at build time,
+  but Docker's layer cache keys on the literal `RUN` command — not on what
+  `@latest` resolves to — so an unchanged Dockerfile keeps serving whatever
+  agent versions were current when the layer was first built. `arbox update`
+  busts just the agent layers (via the `AGENT_REFRESH` build-arg) to pull the
+  newest versions; `arbox update --force` rebuilds the whole image from
+  scratch.
 - Add ad-hoc directories with `--rw`/`--ro` per-invocation; permanent
   additions belong in `launch::mount_specs`.
 

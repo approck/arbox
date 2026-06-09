@@ -5,7 +5,7 @@
 # specific value is required, so a missing build arg fails loudly instead of
 # silently substituting a default.)
 #
-# arbox sandbox image. Built per-host (codename + uid) by `arbox build`.
+# arbox sandbox image. Built per-host (codename + uid) by `arbox update`.
 
 ARG HOST_DISTRO_CODENAME
 FROM ubuntu:${HOST_DISTRO_CODENAME}
@@ -116,6 +116,19 @@ RUN npm install -g \
  && playwright install chromium firefox \
  && chmod -R a+rX /opt/ms-playwright
 
+# Cache-bust barrier for the four agent layers below. `arbox update` passes a
+# fresh value here (a unix timestamp) as a --build-arg, which invalidates this
+# layer and therefore every layer after it — the claude/codex/agy/grok
+# installs re-run and pull their latest published versions, while every
+# expensive layer ABOVE this point (apt, uv, deno, node, the ~700 MB
+# Playwright browser downloads) stays cached. The default 0 keeps ordinary
+# cached builds (the auto-bootstrap on first launch, `arbox update --force`'s
+# --no-cache pass) unaffected: the agents only move when you run `arbox
+# update`. This barrier MUST stay below the last expensive layer and above the
+# first agent install.
+ARG AGENT_REFRESH=0
+RUN echo "arbox agent refresh token: ${AGENT_REFRESH}" >/dev/null
+
 # All four coding agents baked into the image. The host's user config dirs
 # (~/.claude, ~/.claude.json, ~/.codex, ~/.gemini, ~/.config/antigravity,
 # ~/.grok) are still bind-mounted from the host so credentials and history
@@ -179,16 +192,36 @@ RUN if getent group ${HOST_GID} >/dev/null; then \
 
 # Toolchain comes from runtime mounts of ${HOST_HOME}/.cargo and
 # ${HOST_HOME}/.rustup; nothing rust-related is baked into the image.
-ENV PATH=${HOST_HOME}/.cargo/bin:${HOST_HOME}/.local/bin:/usr/local/bin:/usr/bin:/bin
+#
+# Ordering matters: /usr/local/bin (where the baked-in claude/codex/agy/grok/
+# playwright/node/uv/deno live) MUST come before ${HOST_HOME}/.local/bin,
+# which is bind-mounted read-only from the host at runtime. If ~/.local/bin
+# were first (as it once was), a stale host install like
+# ~/.local/bin/claude -> ~/.local/share/claude/versions/X would shadow the
+# freshly-baked binary, making `arbox update` look like a no-op. ~/.cargo/bin
+# stays first so the host's rustup shims win (no agent collides with those).
+ENV PATH=${HOST_HOME}/.cargo/bin:/usr/local/bin:${HOST_HOME}/.local/bin:/usr/bin:/bin
 
 # Marker so the host-side `arbox` binary refuses to run inside its own
 # container (where there's no `docker` to talk to anyway).
 ENV ARBOX_INSIDE=1
 
-# Stop Claude Code's background autoupdater check inside the sandbox.
-# Neither autoupdate nor `claude update`/`claude install` will work in here
-# anyway — upgrade Claude Code on the host, outside of arbox.
+# Stop Claude Code's background autoupdater AND its install-integrity checks
+# inside the sandbox. The agents are baked into the image and bumped with
+# `arbox update` — they are not self-managed in here, so neither
+# `claude update`/`claude install` nor the startup install check apply.
+#
+# DISABLE_INSTALLATION_CHECKS specifically silences the recurring
+#   "claude command at ~/.local/bin/claude missing or broken —
+#    run claude install to repair"
+# warning. The host's shared ~/.claude.json carries `installMethod: native`
+# (on the host, claude was installed at ~/.local/bin), but the container runs
+# the npm-baked /usr/local/bin/claude and deliberately does NOT mount the
+# host's ~/.local/bin — so claude's native-install check would otherwise fire
+# on every launch. (Confirmed against the 2.x binary: the check function
+# early-returns when this env var is truthy.)
 ENV DISABLE_AUTOUPDATER=1
+ENV DISABLE_INSTALLATION_CHECKS=1
 
 USER ${HOST_USER}
 WORKDIR ${HOST_HOME}

@@ -88,14 +88,20 @@ enum Cmd {
         #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
         cmd: Vec<String>,
     },
-    /// Build (or rebuild) the sandbox image for this host.
-    Build {
-        /// Force a rebuild even if the image already exists.
+    /// Refresh the baked-in agents (claude, codex, agy, grok) to their latest
+    /// published versions, rebuilding the image in place.
+    ///
+    /// By default only the four agent layers re-run, so it's quick — the
+    /// apt/uv/deno/node/playwright layers stay cached. Use --force for a full
+    /// clean rebuild of the entire image (re-runs apt, node, the ~700 MB
+    /// Playwright browser downloads, everything).
+    ///
+    /// (Also reachable as `arbox build`.)
+    #[command(alias = "build")]
+    Update {
+        /// Full clean rebuild of the whole image instead of just the agents.
         #[arg(long)]
         force: bool,
-        /// Pass --no-cache to docker build.
-        #[arg(long)]
-        no_cache: bool,
     },
     /// Show host facts, image presence, and mount layout.
     Status,
@@ -142,9 +148,7 @@ fn dispatch(cmd: Cmd, rw: Vec<PathBuf>, ro: Vec<PathBuf>) -> Result<ExitCode> {
         Cmd::Bash => launch::run_bash(rw, ro),
         Cmd::Playwright { args } => launch::run_playwright(args, rw, ro),
         Cmd::Run { cmd } => launch::run_argv(cmd, rw, ro),
-        Cmd::Build { force, no_cache } => {
-            image::build_image(force, no_cache).map(|_| ExitCode::SUCCESS)
-        }
+        Cmd::Update { force } => image::update_image(force).map(|_| ExitCode::SUCCESS),
         Cmd::Status => image::print_status().map(|_| ExitCode::SUCCESS),
         Cmd::Clean => image::clean().map(|_| ExitCode::SUCCESS),
     }

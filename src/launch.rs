@@ -88,16 +88,17 @@ pub fn mount_specs(host: &HostContext) -> Vec<MountSpec> {
         // up the user's identity, aliases, signing config, etc. Skipped if
         // absent on the host.
         MountSpec::new(h.join(".gitconfig"), true, false, None),
-        // Optional: user's local bin (still useful for non-agent tools the
-        // user keeps there). Read-only so the in-container agents can't
-        // shadow themselves with stale host copies.
-        MountSpec::new(h.join(".local").join("bin"), true, false, None),
-        MountSpec::new(
-            h.join(".local").join("share").join("claude"),
-            true,
-            false,
-            None,
-        ),
+        // Deliberately NOT mounted: ~/.local/bin and ~/.local/share/claude.
+        // Those hold the host's own agent BINARIES (~/.local/bin/{claude,
+        // codex,agy} and the ~/.local/share/claude version store) — and arbox
+        // runs the versions baked into the image instead, bumped via
+        // `arbox update`. Mounting them would only let a host copy shadow the
+        // baked binary on PATH (which is exactly the staleness bug this
+        // avoids). All agent DATA — config, credentials, history, memories,
+        // sessions, plans, tasks — lives in the per-agent state dirs mounted
+        // above (~/.claude, ~/.claude.json, ~/.codex, ~/.gemini,
+        // ~/.config/antigravity, ~/.grok), and that's what persists across
+        // runs.
     ]);
 
     specs
