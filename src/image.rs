@@ -191,7 +191,7 @@ pub fn clean() -> Result<()> {
     Ok(())
 }
 
-pub fn print_status() -> Result<()> {
+pub fn print_status(profile: Option<&str>) -> Result<()> {
     // Always print whatever we managed to detect, even on unsupported hosts.
     let host = match host::detect() {
         Ok(h) => h,
@@ -221,6 +221,10 @@ pub fn print_status() -> Result<()> {
     }
     println!("  cwd:                {}", host.cwd.display());
     println!("  term:               {}", host.term);
+    match profile {
+        Some(p) => println!("  profile:            {p}"),
+        None => println!("  profile:            (default — standard auth locations)"),
+    }
 
     if host.distro_id != "ubuntu" {
         println!();
@@ -231,16 +235,26 @@ pub fn print_status() -> Result<()> {
         return Ok(());
     }
 
-    println!("mounts (host == container path):");
-    for m in crate::launch::mount_specs(&host) {
+    println!("mounts (host -> container path):");
+    for m in crate::launch::mount_specs(&host, profile) {
         let mode = if m.read_only { "ro" } else { "rw" };
-        let exists = m.path.exists();
+        let exists = m.src.exists();
         let suffix = match (exists, m.required) {
             (true, _) => "",
             (false, true) => "  [missing — required]",
             (false, false) => "  [missing — skipped]",
         };
-        println!("  {} ({mode}){suffix}", m.path.display());
+        // Most mounts land at the same path on both sides; show the redirect
+        // arrow only for the profile auth files where src != dst.
+        if m.src == m.dst {
+            println!("  {} ({mode}){suffix}", m.src.display());
+        } else {
+            println!(
+                "  {} -> {} ({mode}){suffix}",
+                m.src.display(),
+                m.dst.display()
+            );
+        }
     }
 
     let t = tag(&host);

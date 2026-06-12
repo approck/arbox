@@ -6,11 +6,22 @@ use std::process::{Command, ExitCode, Stdio};
 use crate::host::{self, HostContext};
 use crate::image;
 
-/// One bind-mount the container needs. Mounted at the same absolute path on
-/// both sides — that's what makes cargo's incremental fingerprints carry
-/// across the host ↔ container boundary.
+/// One bind-mount the container needs. Almost every mount lands at the same
+/// absolute path on both sides (`src == dst`) — that's what makes cargo's
+/// incremental fingerprints carry across the host ↔ container boundary.
+///
+/// The exception is `--profile NAME`: each agent's entire state tree is sourced
+/// from under `~/.arbox/profiles/NAME/` while `dst` stays the canonical path
+/// the agent expects (e.g. src `~/.arbox/profiles/personal/.claude` →
+/// dst `~/.claude`). The agent reads/writes the standard location, unaware its
+/// whole config — auth *and* history together — actually lives in the profile
+/// dir, so the two can never drift out of sync the way redirecting auth alone
+/// would risk.
 pub struct MountSpec {
-    pub path: PathBuf,
+    /// Host source path. Existence is checked against this.
+    pub src: PathBuf,
+    /// Container destination path. Equals `src` unless this is a redirect.
+    pub dst: PathBuf,
     pub read_only: bool,
     /// Hard-required: launch fails if missing on host. (Optional mounts are
     /// silently skipped when their host path doesn't exist.)
@@ -19,9 +30,29 @@ pub struct MountSpec {
 }
 
 impl MountSpec {
+    /// Same path on both sides — the common case.
     fn new(path: PathBuf, read_only: bool, required: bool, hint: Option<&'static str>) -> Self {
         Self {
-            path,
+            src: path.clone(),
+            dst: path,
+            read_only,
+            required,
+            hint,
+        }
+    }
+
+    /// Mount host `src` at container `dst` (distinct paths). Used for
+    /// `--profile` auth redirects.
+    fn redirected(
+        src: PathBuf,
+        dst: PathBuf,
+        read_only: bool,
+        required: bool,
+        hint: Option<&'static str>,
+    ) -> Self {
+        Self {
+            src,
+            dst,
             read_only,
             required,
             hint,
@@ -29,7 +60,39 @@ impl MountSpec {
     }
 }
 
-pub fn mount_specs(host: &HostContext) -> Vec<MountSpec> {
+/// Home-relative state paths owned by each coding agent. Whole-tree redirected
+/// into the profile dir under `--profile`, or mounted at the standard home
+/// location by default. Listing the data dirs (not the binaries — those are
+/// baked into the image at /usr/local/bin) is what persists credentials,
+/// history, skills, MCP config, memories, and sessions across container runs.
+const AGENT_STATE: &[&str] = &[
+    // claude: the .claude/ dir (sessions, memories, settings, credentials,
+    // plans, tasks) plus the .claude.json config/auth-identity file beside it.
+    ".claude",
+    ".claude.json",
+    // codex
+    ".codex",
+    // agy: Antigravity reuses the Gemini namespace for skills/MCP/GEMINI.md,
+    // with per-host config under ~/.config/antigravity.
+    ".gemini",
+    ".config/antigravity",
+    // grok
+    ".grok",
+];
+
+/// Root of a named profile's isolated state tree on the host.
+fn profile_root(home: &Path, name: &str) -> PathBuf {
+    home.join(".arbox").join("profiles").join(name)
+}
+
+/// Build the bind-mount list. With no `profile`, agent state mounts at the
+/// standard host locations (shared with your host's own agents). With
+/// `--profile NAME`, each agent's entire state tree is sourced from
+/// `~/.arbox/profiles/NAME/` instead — auth and history move together, so a
+/// second subscription stays fully self-consistent and never touches the
+/// default. Non-agent mounts (workspace, Rust toolchain, ~/.gitconfig) are
+/// always shared regardless of profile.
+pub fn mount_specs(host: &HostContext, profile: Option<&str>) -> Vec<MountSpec> {
     let h = &host.home;
     let mut specs: Vec<MountSpec> = Vec::new();
 
@@ -52,54 +115,47 @@ pub fn mount_specs(host: &HostContext) -> Vec<MountSpec> {
         }
     }
 
-    specs.extend([
-        MountSpec::new(
-            h.join(".cargo"),
-            false,
-            true,
-            Some("install rustup on the host first (https://rustup.rs)"),
-        ),
-        MountSpec::new(
-            h.join(".rustup"),
-            true,
-            true,
-            Some("install rustup on the host first (https://rustup.rs)"),
-        ),
-        // Agent state directories — mounted RW and optional. The agent
-        // BINARIES themselves are baked into the image (claude, codex, agy,
-        // grok all live at /usr/local/bin), so these mounts exist only to
-        // persist credentials, history, skills, MCP config, etc. across
-        // container invocations. `ensure_agent_state` (below) auto-creates
-        // the relevant paths on first launch of each agent verb, so these
-        // mounts are reliably attached without any host-side prep.
-        MountSpec::new(h.join(".claude"), false, false, None),
-        // Claude on Linux stores main config + auth state at $HOME/.claude.json
-        // (a file, distinct from the .claude/ directory above).
-        MountSpec::new(h.join(".claude.json"), false, false, None),
-        MountSpec::new(h.join(".codex"), false, false, None),
-        // Antigravity (`agy`) stores skills + MCP config + GEMINI.md under
-        // ~/.gemini (the Antigravity CLI reuses the Gemini namespace);
-        // per-host config under ~/.config/antigravity.
-        MountSpec::new(h.join(".gemini"), false, false, None),
-        MountSpec::new(h.join(".config").join("antigravity"), false, false, None),
-        // Grok Build CLI stores its auth token + downloads under ~/.grok.
-        MountSpec::new(h.join(".grok"), false, false, None),
-        // Host's ~/.gitconfig (read-only). So git inside the container picks
-        // up the user's identity, aliases, signing config, etc. Skipped if
-        // absent on the host.
-        MountSpec::new(h.join(".gitconfig"), true, false, None),
-        // Deliberately NOT mounted: ~/.local/bin and ~/.local/share/claude.
-        // Those hold the host's own agent BINARIES (~/.local/bin/{claude,
-        // codex,agy} and the ~/.local/share/claude version store) — and arbox
-        // runs the versions baked into the image instead, bumped via
-        // `arbox update`. Mounting them would only let a host copy shadow the
-        // baked binary on PATH (which is exactly the staleness bug this
-        // avoids). All agent DATA — config, credentials, history, memories,
-        // sessions, plans, tasks — lives in the per-agent state dirs mounted
-        // above (~/.claude, ~/.claude.json, ~/.codex, ~/.gemini,
-        // ~/.config/antigravity, ~/.grok), and that's what persists across
-        // runs.
-    ]);
+    specs.push(MountSpec::new(
+        h.join(".cargo"),
+        false,
+        true,
+        Some("install rustup on the host first (https://rustup.rs)"),
+    ));
+    specs.push(MountSpec::new(
+        h.join(".rustup"),
+        true,
+        true,
+        Some("install rustup on the host first (https://rustup.rs)"),
+    ));
+
+    // Agent state dirs/files — mounted RW and optional. `ensure_agent_state`
+    // pre-creates the relevant sources on first launch of each agent verb, so
+    // these mounts reliably attach without any host-side prep. Under a profile
+    // the source moves into the profile dir while the destination (what the
+    // agent sees) stays canonical.
+    for rel in AGENT_STATE {
+        let dst = h.join(rel);
+        match profile {
+            None => specs.push(MountSpec::new(dst, false, false, None)),
+            Some(p) => specs.push(MountSpec::redirected(
+                profile_root(h, p).join(rel),
+                dst,
+                false,
+                false,
+                None,
+            )),
+        }
+    }
+
+    // Host's ~/.gitconfig (read-only) — git identity isn't tied to an agent
+    // subscription, so it stays shared across profiles. Skipped if absent.
+    specs.push(MountSpec::new(h.join(".gitconfig"), true, false, None));
+
+    // Deliberately NOT mounted: ~/.local/bin and ~/.local/share/claude. Those
+    // hold the host's own agent BINARIES — arbox runs the versions baked into
+    // the image instead (bumped via `arbox update`), so mounting the host
+    // copies would only let them shadow the baked binary on PATH (the exact
+    // staleness bug this avoids). All agent DATA lives in the state paths above.
 
     specs
 }
@@ -109,36 +165,72 @@ pub fn mount_specs(host: &HostContext) -> Vec<MountSpec> {
 /// silently skips missing-source mounts and the agent runs with ephemeral
 /// state every launch. Each call is per-verb — only the dirs the specific
 /// agent uses are touched.
-fn ensure_agent_state(host: &HostContext, agent: &str) -> Result<()> {
-    let h = &host.home;
-    let dirs: Vec<PathBuf> = match agent {
-        "claude" => vec![h.join(".claude")],
-        "codex" => vec![h.join(".codex")],
-        "agy" => vec![h.join(".gemini"), h.join(".config").join("antigravity")],
-        "grok" => vec![h.join(".grok")],
+///
+/// `profile` only changes WHERE these paths are rooted: the home directory for
+/// the default, or `~/.arbox/profiles/NAME/` for a named profile. The layout
+/// underneath (`.claude/`, `.claude.json`, …) is identical either way, which is
+/// what lets the profile dir stand in as a self-contained agent home.
+fn ensure_agent_state(host: &HostContext, agent: &str, profile: Option<&str>) -> Result<()> {
+    let base = match profile {
+        None => host.home.clone(),
+        Some(p) => profile_root(&host.home, p),
+    };
+    let dirs: Vec<&str> = match agent {
+        "claude" => vec![".claude"],
+        "codex" => vec![".codex"],
+        "agy" => vec![".gemini", ".config/antigravity"],
+        "grok" => vec![".grok"],
         _ => vec![],
     };
-    for d in &dirs {
-        std::fs::create_dir_all(d)
-            .with_context(|| format!("creating {}", d.display()))?;
+    for rel in &dirs {
+        let d = base.join(rel);
+        std::fs::create_dir_all(&d).with_context(|| format!("creating {}", d.display()))?;
     }
-    // Claude's main config + auth state is a FILE next to its dir, not
-    // inside it. Initialize with `{}` (parseable JSON) so claude's first
-    // load doesn't choke on a zero-byte mount target.
+    // Claude's main config + auth state is a FILE next to its dir. Initialize
+    // with `{}` (parseable JSON) so claude's first load doesn't choke on a
+    // zero-byte mount target, and so the file exists for the bind mount to
+    // attach to (a missing source would be skipped, making it ephemeral).
     if agent == "claude" {
-        let cj = h.join(".claude.json");
+        let cj = base.join(".claude.json");
         if !cj.exists() {
-            std::fs::write(&cj, "{}\n")
-                .with_context(|| format!("creating {}", cj.display()))?;
+            std::fs::write(&cj, "{}\n").with_context(|| format!("creating {}", cj.display()))?;
         }
     }
     Ok(())
 }
 
-pub fn run_claude(extra: Vec<String>, rw: Vec<PathBuf>, ro: Vec<PathBuf>) -> Result<ExitCode> {
+/// Per-invocation launch options shared by every verb: the user's extra
+/// bind-mount paths and the optional `--profile` name. Bundled so adding a
+/// cross-cutting knob doesn't ripple through seven function signatures.
+#[derive(Default)]
+pub struct Opts {
+    pub rw: Vec<PathBuf>,
+    pub ro: Vec<PathBuf>,
+    pub profile: Option<String>,
+}
+
+/// Validate a `--profile` name before it becomes part of a filename. Reject
+/// anything that could escape its directory or produce a surprising sibling.
+pub fn validate_profile_name(name: &str) -> Result<()> {
+    let ok = !name.is_empty()
+        && !name.starts_with('-')
+        && !name.starts_with('.')
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
+    if !ok {
+        bail!(
+            "invalid --profile name {name:?}: use letters, digits, '-' or '_' \
+             (and don't start with '-' or '.')"
+        );
+    }
+    Ok(())
+}
+
+pub fn run_claude(extra: Vec<String>, opts: Opts) -> Result<ExitCode> {
     let host = host::detect()?;
     host::require_git(&host)?;
-    ensure_agent_state(&host, "claude")?;
+    ensure_agent_state(&host, "claude", opts.profile.as_deref())?;
     // The container IS the sandbox, so granting claude full permissions
     // inside is the correct posture.
     let mut argv = vec![
@@ -146,49 +238,51 @@ pub fn run_claude(extra: Vec<String>, rw: Vec<PathBuf>, ro: Vec<PathBuf>) -> Res
         "--dangerously-skip-permissions".to_string(),
     ];
     argv.extend(extra);
-    run(host, argv, rw, ro)
+    run(host, argv, opts)
 }
 
-pub fn run_codex(extra: Vec<String>, rw: Vec<PathBuf>, ro: Vec<PathBuf>) -> Result<ExitCode> {
+pub fn run_codex(extra: Vec<String>, opts: Opts) -> Result<ExitCode> {
     let host = host::detect()?;
     host::require_git(&host)?;
-    ensure_agent_state(&host, "codex")?;
+    ensure_agent_state(&host, "codex", opts.profile.as_deref())?;
     let mut argv = vec![
         "codex".to_string(),
         "--dangerously-bypass-approvals-and-sandbox".to_string(),
     ];
     argv.extend(extra);
-    run(host, argv, rw, ro)
+    run(host, argv, opts)
 }
 
-pub fn run_agy(extra: Vec<String>, rw: Vec<PathBuf>, ro: Vec<PathBuf>) -> Result<ExitCode> {
+pub fn run_agy(extra: Vec<String>, opts: Opts) -> Result<ExitCode> {
     let host = host::detect()?;
     host::require_git(&host)?;
-    ensure_agent_state(&host, "agy")?;
+    ensure_agent_state(&host, "agy", opts.profile.as_deref())?;
     // No documented `--dangerously-*` / `--yolo` flag for Antigravity yet —
     // forward args verbatim. The Docker boundary is still the sandbox; agy
     // itself just runs with whatever approval mode it defaults to. Note
     // that libsecret won't work inside the container (no dbus session), so
     // first-time auth typically goes through agy's SSH-style URL+code flow.
+    // Under `--profile`, agy's whole ~/.gemini + ~/.config/antigravity move
+    // into the profile tree, so whatever it persists there is isolated too.
     let mut argv = vec!["agy".to_string()];
     argv.extend(extra);
-    run(host, argv, rw, ro)
+    run(host, argv, opts)
 }
 
-pub fn run_grok(extra: Vec<String>, rw: Vec<PathBuf>, ro: Vec<PathBuf>) -> Result<ExitCode> {
+pub fn run_grok(extra: Vec<String>, opts: Opts) -> Result<ExitCode> {
     let host = host::detect()?;
     host::require_git(&host)?;
-    ensure_agent_state(&host, "grok")?;
+    ensure_agent_state(&host, "grok", opts.profile.as_deref())?;
     // Grok Build's safety story is its plan-mode review, not a global
     // approval-bypass flag — forward args verbatim. Auth lives in
     // ~/.grok/auth.json (file-based, no keyring dependency), which the
     // ~/.grok mount in `mount_specs` persists across runs.
     let mut argv = vec!["grok".to_string()];
     argv.extend(extra);
-    run(host, argv, rw, ro)
+    run(host, argv, opts)
 }
 
-pub fn run_playwright(extra: Vec<String>, rw: Vec<PathBuf>, ro: Vec<PathBuf>) -> Result<ExitCode> {
+pub fn run_playwright(extra: Vec<String>, opts: Opts) -> Result<ExitCode> {
     let host = host::detect()?;
     host::require_git(&host)?;
     // `playwright` is npm-installed globally in the image. Browsers are
@@ -196,40 +290,46 @@ pub fn run_playwright(extra: Vec<String>, rw: Vec<PathBuf>, ro: Vec<PathBuf>) ->
     // Dockerfile), so this works without any host-side setup.
     let mut argv = vec!["playwright".to_string()];
     argv.extend(extra);
-    run(host, argv, rw, ro)
+    run(host, argv, opts)
 }
 
-pub fn run_bash(rw: Vec<PathBuf>, ro: Vec<PathBuf>) -> Result<ExitCode> {
+pub fn run_bash(opts: Opts) -> Result<ExitCode> {
     let host = host::detect()?;
     host::require_git(&host)?;
-    run(
-        host,
-        vec!["/bin/bash".to_string(), "-l".to_string()],
-        rw,
-        ro,
-    )
+    // No single agent verb here, so provision every file-auth agent's profile
+    // token — whichever agent the user launches from the shell gets isolated.
+    ensure_all_agent_state(&host, opts.profile.as_deref())?;
+    run(host, vec!["/bin/bash".to_string(), "-l".to_string()], opts)
 }
 
-pub fn run_argv(argv: Vec<String>, rw: Vec<PathBuf>, ro: Vec<PathBuf>) -> Result<ExitCode> {
+pub fn run_argv(argv: Vec<String>, opts: Opts) -> Result<ExitCode> {
     if argv.is_empty() {
         bail!("arbox run needs a command");
     }
     let host = host::detect()?;
     host::require_git(&host)?;
-    run(host, argv, rw, ro)
+    ensure_all_agent_state(&host, opts.profile.as_deref())?;
+    run(host, argv, opts)
 }
 
-fn run(
-    host: HostContext,
-    argv: Vec<String>,
-    extra_rw: Vec<PathBuf>,
-    extra_ro: Vec<PathBuf>,
-) -> Result<ExitCode> {
+/// Seed profile state for every agent. Used by the agent-agnostic verbs
+/// (`bash`, `run`) so whichever agent the user launches from the shell finds
+/// its profile tree ready; a no-op without a profile.
+fn ensure_all_agent_state(host: &HostContext, profile: Option<&str>) -> Result<()> {
+    if profile.is_some() {
+        for agent in ["claude", "codex", "agy", "grok"] {
+            ensure_agent_state(host, agent, profile)?;
+        }
+    }
+    Ok(())
+}
+
+fn run(host: HostContext, argv: Vec<String>, opts: Opts) -> Result<ExitCode> {
     ensure_docker_installed()?;
     host::require_supported_distro(&host)?;
-    let mut mounts = mount_specs(&host);
-    append_extra_mounts(&mut mounts, &extra_rw, false)?;
-    append_extra_mounts(&mut mounts, &extra_ro, true)?;
+    let mut mounts = mount_specs(&host, opts.profile.as_deref());
+    append_extra_mounts(&mut mounts, &opts.rw, false)?;
+    append_extra_mounts(&mut mounts, &opts.ro, true)?;
     verify_required_mounts_exist(&mounts)?;
     let tag = image::ensure_built(&host)?;
 
@@ -260,22 +360,18 @@ fn run(
     cmd.arg("-e").arg("LANG=C.UTF-8");
 
     for m in &mounts {
-        if !m.path.exists() {
+        if !m.src.exists() {
             // Optional + missing: skip. Required + missing was caught above.
             continue;
         }
         let arg = if m.read_only {
             format!(
                 "type=bind,src={},dst={},readonly",
-                m.path.display(),
-                m.path.display()
+                m.src.display(),
+                m.dst.display()
             )
         } else {
-            format!(
-                "type=bind,src={},dst={}",
-                m.path.display(),
-                m.path.display()
-            )
+            format!("type=bind,src={},dst={}", m.src.display(), m.dst.display())
         };
         cmd.arg("--mount").arg(arg);
     }
@@ -367,13 +463,82 @@ fn ensure_docker_installed() -> Result<()> {
 
 fn verify_required_mounts_exist(mounts: &[MountSpec]) -> Result<()> {
     for m in mounts {
-        if m.required && !m.path.exists() {
+        if m.required && !m.src.exists() {
             let hint = m.hint.map(|h| format!(" — {h}")).unwrap_or_default();
             bail!(
                 "required mount source {} does not exist{hint}",
-                m.path.display()
+                m.src.display()
             );
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn fake_host() -> HostContext {
+        HostContext {
+            uid: 1000,
+            gid: 1000,
+            username: "jason".to_string(),
+            home: PathBuf::from("/home/jason"),
+            cwd: PathBuf::from("/home/jason/code/app"),
+            term: "xterm".to_string(),
+            distro_id: "ubuntu".to_string(),
+            distro_codename: "noble".to_string(),
+            workspace_root: None,
+            git_common_dir: None,
+        }
+    }
+
+    /// Find the mount whose container destination is `dst`.
+    fn dst<'a>(specs: &'a [MountSpec], dst: &str) -> Option<&'a MountSpec> {
+        specs.iter().find(|m| m.dst == PathBuf::from(dst))
+    }
+
+    #[test]
+    fn default_mounts_agent_state_at_home() {
+        let specs = mount_specs(&fake_host(), None);
+        // Every agent state path mounts same-path (shared with the host).
+        for rel in AGENT_STATE {
+            let m = dst(&specs, &format!("/home/jason/{rel}"))
+                .unwrap_or_else(|| panic!("missing mount for {rel}"));
+            assert_eq!(m.src, m.dst, "{rel} must be a same-path (shared) mount");
+        }
+    }
+
+    #[test]
+    fn profile_redirects_whole_agent_tree_into_profile_dir() {
+        let specs = mount_specs(&fake_host(), Some("personal"));
+
+        // Every agent state path — dirs and the .claude.json file alike — is
+        // sourced from the profile dir while the destination stays canonical.
+        for rel in AGENT_STATE {
+            let m = dst(&specs, &format!("/home/jason/{rel}"))
+                .unwrap_or_else(|| panic!("missing mount for {rel}"));
+            assert_eq!(
+                m.src,
+                PathBuf::from(format!("/home/jason/.arbox/profiles/personal/{rel}")),
+                "{rel} must be sourced from the profile dir"
+            );
+        }
+
+        // Non-agent mounts stay shared even under a profile.
+        for d in ["/home/jason/.cargo", "/home/jason/.rustup", "/home/jason/.gitconfig"] {
+            let m = dst(&specs, d).unwrap();
+            assert_eq!(m.src, m.dst, "{d} must stay shared across profiles");
+        }
+    }
+
+    #[test]
+    fn profile_name_validation() {
+        for good in ["personal", "work", "acct-2", "a_b", "Team1"] {
+            assert!(validate_profile_name(good).is_ok(), "{good} should be valid");
+        }
+        for bad in ["", "bad/name", "../escape", ".hidden", "-leading", "has space"] {
+            assert!(validate_profile_name(bad).is_err(), "{bad} should be invalid");
+        }
+    }
 }

@@ -28,6 +28,15 @@ struct Cli {
     #[arg(long = "downloads", global = true)]
     downloads: bool,
 
+    /// Use a named auth profile (global). Sources each agent's ENTIRE state
+    /// tree (auth + history + memories + sessions + settings) from
+    /// `~/.arbox/profiles/NAME/` instead of the standard host locations, so a
+    /// second subscription runs fully self-contained and never touches your
+    /// default login. Auth and history always match because they live in one
+    /// tree. The default (no --profile) shares your normal host locations.
+    #[arg(long = "profile", value_name = "NAME", global = true)]
+    profile: Option<String>,
+
     #[command(subcommand)]
     cmd: Cmd,
 }
@@ -116,6 +125,12 @@ fn main() -> ExitCode {
         return ExitCode::FAILURE;
     }
     let cli = Cli::parse();
+    if let Some(p) = &cli.profile {
+        if let Err(e) = launch::validate_profile_name(p) {
+            eprintln!("error: {e:#}");
+            return ExitCode::FAILURE;
+        }
+    }
     let mut rw = cli.rw;
     if cli.desktop || cli.downloads {
         let Some(home) = std::env::var_os("HOME") else {
@@ -130,7 +145,12 @@ fn main() -> ExitCode {
             rw.push(home.join("Downloads"));
         }
     }
-    match dispatch(cli.cmd, rw, cli.ro) {
+    let opts = launch::Opts {
+        rw,
+        ro: cli.ro,
+        profile: cli.profile,
+    };
+    match dispatch(cli.cmd, opts) {
         Ok(code) => code,
         Err(e) => {
             eprintln!("error: {e:#}");
@@ -139,17 +159,17 @@ fn main() -> ExitCode {
     }
 }
 
-fn dispatch(cmd: Cmd, rw: Vec<PathBuf>, ro: Vec<PathBuf>) -> Result<ExitCode> {
+fn dispatch(cmd: Cmd, opts: launch::Opts) -> Result<ExitCode> {
     match cmd {
-        Cmd::Claude { args } => launch::run_claude(args, rw, ro),
-        Cmd::Codex { args } => launch::run_codex(args, rw, ro),
-        Cmd::Agy { args } => launch::run_agy(args, rw, ro),
-        Cmd::Grok { args } => launch::run_grok(args, rw, ro),
-        Cmd::Bash => launch::run_bash(rw, ro),
-        Cmd::Playwright { args } => launch::run_playwright(args, rw, ro),
-        Cmd::Run { cmd } => launch::run_argv(cmd, rw, ro),
+        Cmd::Claude { args } => launch::run_claude(args, opts),
+        Cmd::Codex { args } => launch::run_codex(args, opts),
+        Cmd::Agy { args } => launch::run_agy(args, opts),
+        Cmd::Grok { args } => launch::run_grok(args, opts),
+        Cmd::Bash => launch::run_bash(opts),
+        Cmd::Playwright { args } => launch::run_playwright(args, opts),
+        Cmd::Run { cmd } => launch::run_argv(cmd, opts),
         Cmd::Update { force } => image::update_image(force).map(|_| ExitCode::SUCCESS),
-        Cmd::Status => image::print_status().map(|_| ExitCode::SUCCESS),
+        Cmd::Status => image::print_status(opts.profile.as_deref()).map(|_| ExitCode::SUCCESS),
         Cmd::Clean => image::clean().map(|_| ExitCode::SUCCESS),
     }
 }

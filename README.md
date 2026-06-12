@@ -176,6 +176,49 @@ arbox claude --rw ~/code/sibling-repo --ro ~/datasets/fixtures
 
 Required to exist on the host; launches fail loudly if a path is missing.
 
+### Auth profiles (`--profile`)
+
+By default each agent uses its standard host location, so arbox shares your
+normal login, history, and memories with the host. Pass `--profile <NAME>`
+(global, on any launch verb) to run a *second* subscription concurrently under
+a fully self-contained state tree — handy when you want one box on your work
+plan and another on a personal plan at the same time.
+
+A profile sources each agent's **entire state tree** from
+`~/.arbox/profiles/<NAME>/` while the container still sees the canonical path,
+so auth and history always travel together and can never drift apart:
+
+| Host source (profile `personal`)                      | Mounted in container as   |
+|-------------------------------------------------------|---------------------------|
+| `~/.arbox/profiles/personal/.claude`                  | `~/.claude`               |
+| `~/.arbox/profiles/personal/.claude.json`             | `~/.claude.json`          |
+| `~/.arbox/profiles/personal/.codex`                   | `~/.codex`                |
+| `~/.arbox/profiles/personal/.gemini`                  | `~/.gemini`               |
+| `~/.arbox/profiles/personal/.config/antigravity`      | `~/.config/antigravity`   |
+| `~/.arbox/profiles/personal/.grok`                    | `~/.grok`                 |
+
+Everything inside that tree — credentials, sessions (so `--resume` works),
+memories, settings, MCP config — is isolated to the profile and consistent
+with its own auth. The trade-off is intentional: a profile does **not** share
+memories or sessions with the default or with other profiles. Non-agent mounts
+(the workspace, the Rust toolchain, and read-only `~/.gitconfig`) stay shared
+regardless of profile, since git identity isn't tied to a subscription.
+
+The profile tree is created on first launch of each agent verb (its dirs are
+made and `~/.arbox/profiles/<NAME>/.claude.json` is seeded with `{}` so the
+bind mounts attach); then `/login` inside that box populates it.
+
+```bash
+arbox claude --profile personal          # first run: log in inside the box
+arbox --profile personal claude --resume # resumes that profile's own sessions
+arbox --profile personal status          # show the redirected mounts
+```
+
+`agy` is keyring / URL-code based, but because its whole `~/.gemini` and
+`~/.config/antigravity` move into the profile tree, whatever it persists there
+is isolated too. The default profile is unaffected — it keeps using your
+standard host locations.
+
 ## How it works
 
 1. `host::detect()` reads UID/GID, passwd username/home, current directory,
@@ -198,8 +241,10 @@ Required to exist on the host; launches fail loudly if a path is missing.
 5. `launch::mount_specs()` builds the explicit bind-mount list for the
    workspace, git worktree metadata, Rust toolchain, and agent state dirs
    (config, credentials, history, sessions). Agent *binaries* are never
-   mounted — they come from the image. User-supplied `--rw`/`--ro` paths are
-   appended after canonicalization.
+   mounted — they come from the image. With `--profile NAME` each agent's state
+   tree is instead sourced from `~/.arbox/profiles/NAME/` (see
+   [Auth profiles](#auth-profiles---profile)). User-supplied `--rw`/`--ro`
+   paths are appended after canonicalization.
 6. `docker run --rm -i --network host --user UID:GID --workdir <cwd>` runs
    the selected command with host-shaped paths and inherited stdio. `-t` is
    added only when stdin is an interactive terminal.
