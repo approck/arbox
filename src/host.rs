@@ -1,7 +1,7 @@
 use anyhow::{anyhow, bail, Context, Result};
 use std::path::{Path, PathBuf};
 
-use crate::{git, osrelease, passwd};
+use crate::{git, passwd};
 
 /// Everything we need to know about the host to mirror it in the container.
 /// Detected fresh on every invocation. Base facts (uid/gid/distro/etc.) are
@@ -26,9 +26,8 @@ pub struct HostContext {
 }
 
 pub fn detect() -> Result<HostContext> {
-    // SAFETY: getuid/getgid never fail.
-    let uid = unsafe { libc::getuid() };
-    let gid = unsafe { libc::getgid() };
+    let uid = get_uid();
+    let gid = get_gid();
 
     let (username, home) = passwd::user_info(uid)
         .with_context(|| format!("could not resolve passwd entry for uid {uid}"))?;
@@ -38,15 +37,7 @@ pub fn detect() -> Result<HostContext> {
         .canonicalize()
         .context("canonicalizing cwd")?;
 
-    let osrel = osrelease::parse("/etc/os-release").context("reading /etc/os-release")?;
-    let distro_id = osrel
-        .get("ID")
-        .ok_or_else(|| anyhow!("/etc/os-release has no ID="))?
-        .clone();
-    let distro_codename = osrel
-        .get("VERSION_CODENAME")
-        .ok_or_else(|| anyhow!("/etc/os-release has no VERSION_CODENAME="))?
-        .clone();
+    let (distro_id, distro_codename) = get_distro()?;
 
     let term = std::env::var("TERM").unwrap_or_else(|_| "xterm-256color".to_string());
 
@@ -109,4 +100,47 @@ pub fn require_git<'a>(host: &'a HostContext) -> Result<(&'a Path, &'a Path)> {
         );
     }
     Ok((workspace, common))
+}
+
+#[cfg(target_family = "unix")]
+fn get_uid() -> u32 {
+    unsafe { libc::getuid() }
+}
+
+#[cfg(target_family = "windows")]
+fn get_uid() -> u32 {
+    // Windows has no Unix-style uid system. Return 1000, a standard default uid
+    // for Linux container environments that this tool mirrors users into.
+    1000
+}
+
+#[cfg(target_family = "unix")]
+fn get_gid() -> u32 {
+    unsafe { libc::getgid() }
+}
+
+#[cfg(target_family = "windows")]
+fn get_gid() -> u32 {
+    // Windows has no Unix-style gid system. Return 1000, a standard default gid
+    // for Linux container environments that this tool mirrors users into.
+    1000
+}
+
+#[cfg(target_family = "unix")]
+fn get_distro() -> Result<(String, String)> {
+    let osrel = osrelease::parse("/etc/os-release").context("reading /etc/os-release")?;
+    let id = osrel
+        .get("ID")
+        .ok_or_else(|| anyhow!("/etc/os-release has no ID="))?
+        .clone();
+    let codename = osrel
+        .get("VERSION_CODENAME")
+        .ok_or_else(|| anyhow!("/etc/os-release has no VERSION_CODENAME="))?
+        .clone();
+    Ok((id, codename))
+}
+
+#[cfg(target_family = "windows")]
+fn get_distro() -> Result<(String, String)> {
+    Ok(("ubuntu".to_string(), "noble".to_string()))
 }

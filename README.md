@@ -2,7 +2,7 @@
 
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
 
-# Designed for Ubuntu Linux. Requires Docker.
+# Linux and Windows. Requires Docker.
 
 ## LLM Produced Code Notice
 
@@ -85,11 +85,13 @@ escape or host shell access.
 
 ## Requirements
 
-- **Ubuntu Linux** host. The image is built from your host's Ubuntu codename
-  so libc and toolchain behavior line up with the host.
-- **Docker Engine** on `PATH`.
-- **[rustup](https://rustup.rs)** installed on the host. `~/.cargo` and
-  `~/.rustup` must exist before launching arbox.
+- **Ubuntu Linux or Windows** host with Docker. On Linux, the image is built
+  from your host's Ubuntu codename so libc and toolchain behavior line up with
+  the host. On Windows, the image runs `ubuntu:noble` inside Docker Desktop.
+- **Docker Engine** on `PATH`. On Windows, Docker Desktop is required.
+- **[rustup](https://rustup.rs)** installed on the host (Linux only). `~/.cargo`
+  and `~/.rustup` must exist before launching arbox. On Windows, rustup is
+  installed inside the container automatically.
 - **Git** on the host. The workspace is resolved via `git rev-parse
   --show-toplevel`.
 - **For the AI agents (claude, codex, agy, grok): nothing on the host.**
@@ -218,6 +220,38 @@ arbox --profile personal status          # show the redirected mounts
 `~/.config/antigravity` move into the profile tree, whatever it persists there
 is isolated too. The default profile is unaffected — it keeps using your
 standard host locations.
+
+## Windows Quirks
+
+### Git Worktrees
+
+On Windows, git worktrees require special handling because the `.git` file contains a path reference that doesn't work inside the container. **arbox automatically handles this** by:
+
+1. Converting the absolute Windows path in `.git` to a relative path
+2. Adding the container mount path to git's `safe.directory` config on launch
+3. Removing the `safe.directory` entry when the container exits
+
+This happens transparently when you launch any arbox command from a worktree,
+so no manual setup or cleanup is needed.
+
+If you want to manually view or manage safe.directory entries:
+
+```bash
+# View all safe.directory entries
+git config --global --get-all safe.directory
+
+# Remove a specific path
+git config --global --unset safe.directory /mnt/c/Users/<username>/path/to/worktree
+
+# Remove all entries
+git config --global --unset-all safe.directory
+```
+
+### User ID/Group ID
+
+On Windows, arbox uses a hardcoded UID and GID of `1000` for container processes, since Windows does not have Unix-style user and group IDs. This value is a standard default for the first non-root user in Linux container environments.
+
+Files created inside the container will appear to be owned by UID/GID 1000 in the container, but on the Windows host they are owned by your Windows user account as expected. This allows the container to function as a normal Linux environment while keeping host file ownership correct.
 
 ## How it works
 
