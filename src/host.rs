@@ -1,7 +1,7 @@
 use anyhow::{anyhow, bail, Context, Result};
 use std::path::{Path, PathBuf};
 
-use crate::{git, passwd};
+use crate::{git, osrelease, passwd};
 
 /// Everything we need to know about the host to mirror it in the container.
 /// Detected fresh on every invocation. Base facts (uid/gid/distro/etc.) are
@@ -79,7 +79,7 @@ pub fn require_supported_distro(host: &HostContext) -> Result<()> {
 
 /// Demand a git workspace for verbs that need one (claude/codex/bash/run).
 /// Returns the workspace root and common git dir as a borrowed pair.
-pub fn require_git<'a>(host: &'a HostContext) -> Result<(&'a Path, &'a Path)> {
+pub fn require_git(host: &HostContext) -> Result<(&Path, &Path)> {
     let workspace = host.workspace_root.as_deref().ok_or_else(|| {
         anyhow!(
             "arbox must be run inside a git repository (cwd: {})",

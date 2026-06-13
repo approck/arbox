@@ -161,7 +161,12 @@ pub fn mount_specs(host: &HostContext, profile: Option<&str>) -> Vec<MountSpec> 
     // Optional: user's local bin (still useful for non-agent tools the
     // user keeps there). Read-only so the in-container agents can't
     // shadow themselves with stale host copies.
-    specs.push(MountSpec::new(h.join(".local").join("bin"), true, false, None));
+    specs.push(MountSpec::new(
+        h.join(".local").join("bin"),
+        true,
+        false,
+        None,
+    ));
     specs.push(MountSpec::new(
         h.join(".local").join("share").join("claude"),
         true,
@@ -423,7 +428,14 @@ fn run(host: HostContext, argv: Vec<String>, opts: Opts) -> Result<ExitCode> {
     // a glance that you're inside the sandbox shell vs. the host shell.
     // Adding `--add-host ARBOX:127.0.0.1` ensures that sudo inside the container
     // can resolve its own hostname without throwing warnings.
-    cmd.args(["--hostname", "ARBOX", "--network", "host", "--add-host", "ARBOX:127.0.0.1"]);
+    cmd.args([
+        "--hostname",
+        "ARBOX",
+        "--network",
+        "host",
+        "--add-host",
+        "ARBOX:127.0.0.1",
+    ]);
     // /dev/shm defaults to 64 MB in Docker, which is enough to crash Chromium
     // on any non-trivial page. Bump it once here so every Playwright test
     // doesn't have to remember --disable-dev-shm-usage.
@@ -603,7 +615,7 @@ mod tests {
 
     /// Find the mount whose container destination is `dst`.
     fn dst<'a>(specs: &'a [MountSpec], dst: &str) -> Option<&'a MountSpec> {
-        specs.iter().find(|m| m.dst == PathBuf::from(dst))
+        specs.iter().find(|m| m.dst.as_path() == Path::new(dst))
     }
 
     #[test]
@@ -634,7 +646,11 @@ mod tests {
         }
 
         // Non-agent mounts stay shared even under a profile.
-        for d in ["/home/jason/.cargo", "/home/jason/.rustup", "/home/jason/.gitconfig"] {
+        for d in [
+            "/home/jason/.cargo",
+            "/home/jason/.rustup",
+            "/home/jason/.gitconfig",
+        ] {
             let m = dst(&specs, d).unwrap();
             assert_eq!(m.src, m.dst, "{d} must stay shared across profiles");
         }
@@ -643,10 +659,23 @@ mod tests {
     #[test]
     fn profile_name_validation() {
         for good in ["personal", "work", "acct-2", "a_b", "Team1"] {
-            assert!(validate_profile_name(good).is_ok(), "{good} should be valid");
+            assert!(
+                validate_profile_name(good).is_ok(),
+                "{good} should be valid"
+            );
         }
-        for bad in ["", "bad/name", "../escape", ".hidden", "-leading", "has space"] {
-            assert!(validate_profile_name(bad).is_err(), "{bad} should be invalid");
+        for bad in [
+            "",
+            "bad/name",
+            "../escape",
+            ".hidden",
+            "-leading",
+            "has space",
+        ] {
+            assert!(
+                validate_profile_name(bad).is_err(),
+                "{bad} should be invalid"
+            );
         }
     }
 }
