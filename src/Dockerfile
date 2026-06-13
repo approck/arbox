@@ -216,7 +216,7 @@ RUN if [ "${WINDOWS_HOST}" = "true" ]; then \
 # stays first so the host's rustup shims win (no agent collides with those).
 # Windows: /usr/local/cargo/bin is used (set via CARGO_HOME above).
 # Linux: host's ${HOST_HOME}/.cargo/bin is mounted and used.
-ENV PATH=/usr/local/cargo/bin:/root/.cargo/bin:${HOST_HOME}/.cargo/bin:${HOST_HOME}/.local/bin:/usr/local/bin:/usr/bin:/bin
+ENV PATH=/usr/local/cargo/bin:/root/.cargo/bin:${HOST_HOME}/.cargo/bin:/usr/local/bin:${HOST_HOME}/.local/bin:/usr/bin:/bin
 
 # Marker so the host-side `arbox` binary refuses to run inside its own
 # container (where there's no `docker` to talk to anyway).

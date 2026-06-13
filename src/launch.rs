@@ -155,28 +155,21 @@ pub fn mount_specs(host: &HostContext, profile: Option<&str>) -> Vec<MountSpec> 
     // subscription, so it stays shared across profiles. Skipped if absent.
     specs.push(MountSpec::new(h.join(".gitconfig"), true, false, None));
 
-    // Directory for approck-generated files
-    specs.push(MountSpec::new(h.join(".approck"), true, false, None));
-
-    // Optional: user's local bin (still useful for non-agent tools the
-    // user keeps there). Read-only so the in-container agents can't
-    // shadow themselves with stale host copies.
+    // approck's data dir (~/.local/share/approck), read-only. Optional —
+    // skipped if absent.
     specs.push(MountSpec::new(
-        h.join(".local").join("bin"),
-        true,
-        false,
-        None,
-    ));
-    specs.push(MountSpec::new(
-        h.join(".local").join("share").join("claude"),
+        h.join(".local").join("share").join("approck"),
         true,
         false,
         None,
     ));
 
-    // Deliberately avoid mounting other host locations that hold agent
-    // BINARIES so the versions baked into the image (bumped via `arbox update`)
-    // are used instead. All agent DATA lives in the state paths above.
+    // Deliberately NOT mounted: ~/.local/bin and ~/.local/share/claude. Those
+    // hold the host's own agent BINARIES (claude/codex/agy live there) — arbox
+    // runs the versions baked into the image instead (bumped via `arbox
+    // update`), so mounting the host copies would only let them shadow the
+    // baked binary on PATH (the exact staleness bug this avoids). All agent
+    // DATA lives in the state paths above.
 
     specs
 }
