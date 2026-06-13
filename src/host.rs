@@ -1,7 +1,7 @@
 use anyhow::{anyhow, bail, Context, Result};
 use std::path::{Path, PathBuf};
 
-use crate::{git, osrelease, passwd};
+use crate::{git, passwd};
 
 /// Everything we need to know about the host to mirror it in the container.
 /// Detected fresh on every invocation. Base facts (uid/gid/distro/etc.) are
