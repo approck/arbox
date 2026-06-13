@@ -151,6 +151,9 @@ pub fn mount_specs(host: &HostContext, profile: Option<&str>) -> Vec<MountSpec> 
     // subscription, so it stays shared across profiles. Skipped if absent.
     specs.push(MountSpec::new(h.join(".gitconfig"), true, false, None));
 
+    // Directory for approck-generated files
+    specs.push(MountSpec::new(h.join(".approck"), true, false, None));
+
     // Deliberately NOT mounted: ~/.local/bin and ~/.local/share/claude. Those
     // hold the host's own agent BINARIES — arbox runs the versions baked into
     // the image instead (bumped via `arbox update`), so mounting the host
