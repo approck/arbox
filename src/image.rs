@@ -32,16 +32,28 @@ fn dockerfile_hash() -> String {
     format!("{:08x}", h.finish() as u32)
 }
 
-/// Tag prefix shared by every arbox image for the current host (codename +
-/// uid). Used by `clean` to wipe stale images when the Dockerfile-hash
-/// changes.
+/// Tag prefix shared by every arbox image for the current host (platform +
+/// codename + uid). Used by `clean` to wipe stale images when the
+/// Dockerfile-hash changes.
+///
+/// The platform segment (`win`/`nix`) matters because a Windows build and a
+/// Linux build can otherwise collide: the embedded Dockerfile bytes are
+/// identical (same `dockerfile_hash`) and Windows hardcodes uid 1000 + the
+/// `noble` codename, but the two builds differ (Windows bakes rustup and skips
+/// host-user creation via `WINDOWS_HOST=true`). Without this, a shared Docker
+/// Desktop/WSL2 daemon would let `ensure_built` serve the wrong-platform image.
 pub fn tag_prefix(host: &HostContext) -> String {
-    format!("arbox:{}-uid{}-", host.distro_codename, host.uid)
+    let plat = if cfg!(target_family = "windows") {
+        "win"
+    } else {
+        "nix"
+    };
+    format!("arbox:{plat}-{}-uid{}-", host.distro_codename, host.uid)
 }
 
-/// `arbox:<distro_codename>-uid<uid>-<dockerfile_hash>`. Two users on the
-/// same machine, two machines on different Ubuntu releases, or two builds
-/// of different Dockerfiles all get distinct tags.
+/// `arbox:<plat>-<distro_codename>-uid<uid>-<dockerfile_hash>`. Two users on
+/// the same machine, two machines on different Ubuntu releases, two host
+/// platforms, or two builds of different Dockerfiles all get distinct tags.
 pub fn tag(host: &HostContext) -> String {
     format!("{}{}", tag_prefix(host), dockerfile_hash())
 }
@@ -107,11 +119,7 @@ fn build_with_args(host: &HostContext, t: &str, mode: BuildMode) -> Result<()> {
     std::fs::write(&dockerfile_path, DOCKERFILE)
         .with_context(|| format!("writing {}", dockerfile_path.display()))?;
 
-    let home_str = if cfg!(target_family = "windows") {
-        crate::path::to_wsl(&host.home)
-    } else {
-        host.home.display().to_string()
-    };
+    let home_str = crate::path::to_container(&host.home)?;
 
     let mut cmd = Command::new("docker");
     cmd.arg("build")

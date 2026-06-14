@@ -216,7 +216,7 @@ fn fixup_windows_worktree(host: &HostContext) -> Result<Option<String>> {
         }
 
         // Add the container path to git's safe.directory
-        let container_path = crate::path::to_wsl(workspace);
+        let container_path = crate::path::to_container(workspace)?;
         let mut cmd = Command::new("git");
         cmd.args([
             "config",
@@ -435,14 +435,10 @@ fn run(host: HostContext, argv: Vec<String>, opts: Opts) -> Result<ExitCode> {
     cmd.args(["--shm-size", "1g"]);
     cmd.arg("--user").arg(format!("{}:{}", host.uid, host.gid));
 
-    if cfg!(target_family = "windows") {
-        cmd.arg("--workdir").arg(crate::path::to_wsl(&host.cwd));
-        cmd.arg("-e")
-            .arg(format!("HOME={}", crate::path::to_wsl(&host.home)));
-    } else {
-        cmd.arg("--workdir").arg(&host.cwd);
-        cmd.arg("-e").arg(format!("HOME={}", host.home.display()));
-    }
+    cmd.arg("--workdir")
+        .arg(crate::path::to_container(&host.cwd)?);
+    cmd.arg("-e")
+        .arg(format!("HOME={}", crate::path::to_container(&host.home)?));
 
     cmd.arg("-e").arg(format!("USER={}", host.username));
     cmd.arg("-e").arg(format!("TERM={}", host.term));
@@ -457,22 +453,12 @@ fn run(host: HostContext, argv: Vec<String>, opts: Opts) -> Result<ExitCode> {
             continue;
         }
 
-        let mut arg = if cfg!(target_family = "windows") {
-            const PREFIX: &str = r#"\\?\"#;
-
-            let mut src: &str = &m.src.to_string_lossy();
-            src = src.strip_prefix(PREFIX).unwrap_or(src);
-            let dst = crate::path::to_wsl(&m.dst);
-
-            format!("type=bind,src={src},dst={dst}")
-        } else {
-            format!("type=bind,src={},dst={}", m.src.display(), m.dst.display())
-        };
-
+        let src = crate::path::to_mount_src(&m.src);
+        let dst = crate::path::to_container(&m.dst)?;
+        let mut arg = format!("type=bind,src={src},dst={dst}");
         if m.read_only {
             arg.push_str(",readonly");
         }
-
         cmd.arg("--mount").arg(arg);
     }
 
@@ -638,12 +624,15 @@ mod tests {
             );
         }
 
-        // Non-agent mounts stay shared even under a profile.
-        for d in [
-            "/home/jason/.cargo",
-            "/home/jason/.rustup",
-            "/home/jason/.gitconfig",
-        ] {
+        // Non-agent mounts stay shared even under a profile. ~/.gitconfig is
+        // mounted on every platform; ~/.cargo and ~/.rustup only on non-Windows
+        // hosts (Windows bakes the toolchain into the image instead), so guard
+        // those so the test doesn't panic on a Windows build.
+        let mut shared = vec!["/home/jason/.gitconfig"];
+        if !cfg!(target_family = "windows") {
+            shared.extend(["/home/jason/.cargo", "/home/jason/.rustup"]);
+        }
+        for d in shared {
             let m = dst(&specs, d).unwrap();
             assert_eq!(m.src, m.dst, "{d} must stay shared across profiles");
         }
