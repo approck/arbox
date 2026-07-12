@@ -19,14 +19,14 @@ support.
 
 The goal of this project is to make it easy to build a host-shaped Docker
 container with the same uid, gid, Ubuntu codename, Rust toolchain, and
-claude/codex setup (via mounts), and then make it equally easy to launch
-claude or codex inside that container with the current git repo mounted at
-the same absolute path.
+coding-agent setup (via mounts), and then make it equally easy to launch an
+agent (claude, codex, opencode, agy, grok) inside that container with the
+current git repo mounted at the same absolute path.
 
 ## About (LLM Generated)
 
-A Docker-based agent sandbox for running Claude Code, Codex CLI, and
-arbitrary build commands with a narrower view of the host than a normal
+A Docker-based agent sandbox for running Claude Code, Codex CLI, OpenCode,
+and arbitrary build commands with a narrower view of the host than a normal
 shell.
 
 `arbox` builds a per-host Ubuntu image from an embedded Dockerfile, mirrors
@@ -56,13 +56,16 @@ or a process that you intentionally gave access to your mounted credentials.
   the container picks up your identity, aliases, and signing config.
 - **`~/.local/bin` and `~/.local/share/claude` are deliberately NOT mounted.**
   Those hold the host's own agent binaries and claude version store; arbox
-  runs the claude/codex/agy/grok versions baked into the image (bumped with
-  `arbox update`), so mounting the host copies would only let them shadow the
-  baked binaries on `PATH`. Only agent *state* is shared — see the next bullet.
+  runs the claude/codex/opencode/agy/grok versions baked into the image
+  (bumped with `arbox update`), so mounting the host copies would only let
+  them shadow the baked binaries on `PATH`. Only agent *state* is shared —
+  see the next bullet.
 - **Agent data dirs are mounted read-write** so config, credentials, history,
   memories, and sessions persist across container rebuilds: `~/.claude` +
-  `~/.claude.json` (claude), `~/.codex`, `~/.gemini` + `~/.config/antigravity`
-  (agy), and `~/.grok`. A compromised agent could modify these.
+  `~/.claude.json` (claude), `~/.codex`, `~/.config/opencode` +
+  `~/.local/share/opencode` (opencode — state only, no binaries live there),
+  `~/.gemini` + `~/.config/antigravity` (agy), and `~/.grok`. A compromised
+  agent could modify these.
 - **The host Wayland display socket is mounted when available** so
   `wl-paste` works for clipboard image flows. Only the socket file is
   mounted, not the full `$XDG_RUNTIME_DIR`.
@@ -94,10 +97,11 @@ escape or host shell access.
   installed inside the container automatically.
 - **Git** on the host. The workspace is resolved via `git rev-parse
   --show-toplevel`.
-- **For the AI agents (claude, codex, agy, grok): nothing on the host.**
-  All four CLIs are baked into the image. The first time you run a given
-  verb, arbox creates the agent's state paths on the host (`~/.claude` +
-  `~/.claude.json` for claude, `~/.codex` for codex, `~/.gemini` +
+- **For the AI agents (claude, codex, opencode, agy, grok): nothing on the
+  host.** All five CLIs are baked into the image. The first time you run a
+  given verb, arbox creates the agent's state paths on the host (`~/.claude`
+  + `~/.claude.json` for claude, `~/.codex` for codex, `~/.config/opencode` +
+  `~/.local/share/opencode` for opencode, `~/.gemini` +
   `~/.config/antigravity` for agy, `~/.grok` for grok) and bind-mounts them
   in so credentials and history persist across subsequent runs.
 
@@ -123,14 +127,15 @@ arbox bash                         # interactive bash, project auto-mounted
 arbox run -- cargo test            # one-off command
 arbox claude                       # Claude Code, project auto-mounted
 arbox codex                        # Codex CLI, project auto-mounted
+arbox opencode                     # OpenCode TUI (works with local Ollama)
 arbox agy                          # Google Antigravity CLI
 arbox grok                         # xAI Grok Build CLI
 ```
 
 The first build can take a few minutes because the image installs common
 development packages plus uv, deno, Node 22, Playwright with chromium +
-firefox baked in (~700 MB just for the browsers), and all four coding
-agents (claude, codex, agy, grok). Subsequent launches reuse the per-host
+firefox baked in (~700 MB just for the browsers), and all five coding
+agents (claude, codex, opencode, agy, grok). Subsequent launches reuse the per-host
 image tag, which is `arbox:<ubuntu-codename>-uid<uid>-<dockerfile-hash>`.
 The Dockerfile-content hash is the trailing 8 hex chars; editing the
 embedded Dockerfile changes the hash, which makes the next launch verb
@@ -148,24 +153,25 @@ clear message.
 |---------------------------------|-------------|
 | `arbox claude [FLAGS] -- ARGS...` | Run Claude Code with `--dangerously-skip-permissions`. Binary baked into image; `~/.claude` + `~/.claude.json` mount from the host if present. |
 | `arbox codex  [FLAGS] -- ARGS...` | Run Codex CLI with `--dangerously-bypass-approvals-and-sandbox`. Binary baked into image; `~/.codex` mounts from the host if present. |
+| `arbox opencode [FLAGS] -- ARGS...` | Run the OpenCode TUI. Binary baked into image; `~/.config/opencode` (config) and `~/.local/share/opencode` (auth in `auth.json`, sessions) mount from the host. Host-local providers like Ollama on `localhost:11434` work thanks to host networking. |
 | `arbox agy    [FLAGS] -- ARGS...` | Run Google Antigravity's `agy` CLI. Binary baked into image; `~/.gemini` and `~/.config/antigravity` mount from the host. First-time auth uses agy's SSH-style URL+code flow since libsecret isn't reachable inside the container. |
 | `arbox grok   [FLAGS] -- ARGS...` | Run xAI's Grok Build CLI. Binary baked into image; `~/.grok` mounts from the host (token lives in `~/.grok/auth.json`). |
 | `arbox bash   [FLAGS]`          | Open an interactive login bash inside the container. |
 | `arbox playwright [FLAGS] -- ARGS...` | Run the Playwright CLI (`test`, `codegen`, `show-report`, …). Image ships Node + Playwright + chromium + firefox. |
 | `arbox run    [FLAGS] -- CMD...`  | Run a one-off command inside the container. |
-| `arbox update`                  | Refresh the baked-in agents (claude, codex, agy, grok) to their latest published versions, rebuilding only the agent layers (quick — the apt/node/playwright layers stay cached). Builds the image from scratch if it doesn't exist yet. |
+| `arbox update`                  | Refresh the baked-in agents (claude, codex, opencode, agy, grok) to their latest published versions, rebuilding only the agent layers (quick — the apt/node/playwright layers stay cached). Builds the image from scratch if it doesn't exist yet. |
 | `arbox update --force`          | Full clean rebuild of the entire image (`--no-cache`): re-runs apt, node, the Playwright browser downloads, everything. |
 | `arbox status`                  | Show host facts, mount layout, image presence, and network mode. Works outside a git repository (skips the workspace mount in that case). |
 | `arbox clean`                   | Remove every arbox image whose tag has the current host's prefix. |
 
-`claude`, `codex`, `agy`, `grok`, `bash`, and `run` must be invoked from
-inside a git repository — they mount the git toplevel as the workspace and
-`cd` into your current directory. `status`, `update`, and `clean` do not
-require a repo.
+`claude`, `codex`, `opencode`, `agy`, `grok`, `bash`, and `run` must be
+invoked from inside a git repository — they mount the git toplevel as the
+workspace and `cd` into your current directory. `status`, `update`, and
+`clean` do not require a repo.
 
 ### Extra bind-mount flags
 
-`claude`, `codex`, `agy`, `grok`, `bash`, and `run` accept zero or more `--rw <PATH>` and
+`claude`, `codex`, `opencode`, `agy`, `grok`, `bash`, and `run` accept zero or more `--rw <PATH>` and
 `--ro <PATH>` options. Each path is canonicalized (relative paths and
 symlinks resolve against the host filesystem) and mounted at the same
 absolute path inside the container.
@@ -195,6 +201,8 @@ so auth and history always travel together and can never drift apart:
 | `~/.arbox/profiles/personal/.claude`                  | `~/.claude`               |
 | `~/.arbox/profiles/personal/.claude.json`             | `~/.claude.json`          |
 | `~/.arbox/profiles/personal/.codex`                   | `~/.codex`                |
+| `~/.arbox/profiles/personal/.config/opencode`         | `~/.config/opencode`      |
+| `~/.arbox/profiles/personal/.local/share/opencode`    | `~/.local/share/opencode` |
 | `~/.arbox/profiles/personal/.gemini`                  | `~/.gemini`               |
 | `~/.arbox/profiles/personal/.config/antigravity`      | `~/.config/antigravity`   |
 | `~/.arbox/profiles/personal/.grok`                    | `~/.grok`                 |
@@ -293,7 +301,7 @@ Most behavior is controlled by what's on your host:
 - The current directory selects the git workspace to mount.
 - Editing `src/Dockerfile` invalidates the cached image tag automatically;
   the next launch verb rebuilds with no extra flags.
-- The agents (claude, codex, agy, grok) are pinned to `@latest` at build time,
+- The agents (claude, codex, opencode, agy, grok) are pinned to `@latest` at build time,
   but Docker's layer cache keys on the literal `RUN` command — not on what
   `@latest` resolves to — so an unchanged Dockerfile keeps serving whatever
   agent versions were current when the layer was first built. `arbox update`

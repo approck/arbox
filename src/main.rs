@@ -59,6 +59,18 @@ enum Cmd {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
+    /// Run the OpenCode (`opencode`) TUI.
+    ///
+    /// The binary is baked into the image; ~/.config/opencode (config,
+    /// themes, agents) and ~/.local/share/opencode (auth.json, sessions)
+    /// mount from the host. No approval-bypass flag exists or is needed —
+    /// opencode defaults to permissive permissions. Host-local providers
+    /// (e.g. Ollama on localhost:11434) work because the container uses
+    /// host networking. All trailing args forwarded.
+    Opencode {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
     /// Run Google Antigravity's `agy` CLI.
     ///
     /// The binary is baked into the image; ~/.gemini and
@@ -97,10 +109,10 @@ enum Cmd {
         #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
         cmd: Vec<String>,
     },
-    /// Refresh the baked-in agents (claude, codex, agy, grok) to their latest
-    /// published versions, rebuilding the image in place.
+    /// Refresh the baked-in agents (claude, codex, opencode, agy, grok) to
+    /// their latest published versions, rebuilding the image in place.
     ///
-    /// By default only the four agent layers re-run, so it's quick — the
+    /// By default only the five agent layers re-run, so it's quick — the
     /// apt/uv/deno/node/playwright layers stay cached. Use --force for a full
     /// clean rebuild of the entire image (re-runs apt, node, the ~700 MB
     /// Playwright browser downloads, everything).
@@ -163,6 +175,7 @@ fn dispatch(cmd: Cmd, opts: launch::Opts) -> Result<ExitCode> {
     match cmd {
         Cmd::Claude { args } => launch::run_claude(args, opts),
         Cmd::Codex { args } => launch::run_codex(args, opts),
+        Cmd::Opencode { args } => launch::run_opencode(args, opts),
         Cmd::Agy { args } => launch::run_agy(args, opts),
         Cmd::Grok { args } => launch::run_grok(args, opts),
         Cmd::Bash => launch::run_bash(opts),

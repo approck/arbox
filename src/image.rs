@@ -12,7 +12,7 @@ enum BuildMode {
     /// Plain cached build — used by the auto-bootstrap on first launch. The
     /// agents come out at whatever version the cached layers already hold.
     Cached,
-    /// Cached build, but pass a fresh `AGENT_REFRESH` token so the four agent
+    /// Cached build, but pass a fresh `AGENT_REFRESH` token so the five agent
     /// layers (and only those) re-run and pull their latest versions. Every
     /// expensive layer above the cache-bust barrier stays cached.
     RefreshAgents,
@@ -83,8 +83,8 @@ pub fn ensure_built(host: &HostContext) -> Result<String> {
     Ok(t)
 }
 
-/// Refresh the baked-in agents (claude, codex, agy, grok) to their latest
-/// published versions by rebuilding the image's agent layers in place.
+/// Refresh the baked-in agents (claude, codex, opencode, agy, grok) to their
+/// latest published versions by rebuilding the image's agent layers in place.
 ///
 /// The image keeps the same tag, so launch verbs pick up the refreshed agents
 /// automatically. By default only the agent layers re-run (a fresh

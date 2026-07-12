@@ -116,9 +116,9 @@ RUN npm install -g \
  && playwright install chromium firefox \
  && chmod -R a+rX /opt/ms-playwright
 
-# Cache-bust barrier for the four agent layers below. `arbox update` passes a
+# Cache-bust barrier for the five agent layers below. `arbox update` passes a
 # fresh value here (a unix timestamp) as a --build-arg, which invalidates this
-# layer and therefore every layer after it — the claude/codex/agy/grok
+# layer and therefore every layer after it — the claude/codex/opencode/agy/grok
 # installs re-run and pull their latest published versions, while every
 # expensive layer ABOVE this point (apt, uv, deno, node, the ~700 MB
 # Playwright browser downloads) stays cached. The default 0 keeps ordinary
@@ -129,21 +129,27 @@ RUN npm install -g \
 ARG AGENT_REFRESH=0
 RUN echo "arbox agent refresh token: ${AGENT_REFRESH}" >/dev/null
 
-# All four coding agents baked into the image. The host's user config dirs
-# (~/.claude, ~/.claude.json, ~/.codex, ~/.gemini, ~/.config/antigravity,
-# ~/.grok) are still bind-mounted from the host so credentials and history
-# persist across container invocations, but the BINARIES live in the image —
-# no host install needed, and the host's ~/.local/bin shadow is no longer
-# relied on for agent launches.
+# All five coding agents baked into the image. The host's user config dirs
+# (~/.claude, ~/.claude.json, ~/.codex, ~/.config/opencode,
+# ~/.local/share/opencode, ~/.gemini, ~/.config/antigravity, ~/.grok) are
+# still bind-mounted from the host so credentials and history persist across
+# container invocations, but the BINARIES live in the image — no host install
+# needed, and the host's ~/.local/bin shadow is no longer relied on for agent
+# launches.
 #
-# claude + codex via npm (official distribution channels). agy and grok via
-# their respective install.sh scripts, run with a staged HOME so their
-# self-update / download caches don't pollute /root.
+# claude + codex + opencode via npm (official distribution channels; the
+# opencode-ai package resolves the right platform binary through its
+# optionalDependencies). agy and grok via their respective install.sh
+# scripts, run with a staged HOME so their self-update / download caches
+# don't pollute /root.
 ARG CLAUDE_CODE_VERSION=latest
 RUN npm install -g "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}"
 
 ARG CODEX_VERSION=latest
 RUN npm install -g "@openai/codex@${CODEX_VERSION}"
+
+ARG OPENCODE_VERSION=latest
+RUN npm install -g "opencode-ai@${OPENCODE_VERSION}"
 
 # Antigravity CLI (`agy`). The install.sh accepts `--dir` for a custom
 # install location; we stage the script's transient files under a temp HOME
@@ -191,8 +197,21 @@ RUN if [ "${WINDOWS_HOST}" = "false" ]; then \
           useradd -u ${HOST_UID} -g ${HOST_GID} -d ${HOST_HOME} -m -s /bin/bash ${HOST_USER}; \
       fi && \
       echo "${HOST_USER} ALL=(ALL) NOPASSWD: ALL" > /etc/sudoers.d/${HOST_USER} && \
-      chmod 440 /etc/sudoers.d/${HOST_USER}; \
+      chmod 440 /etc/sudoers.d/${HOST_USER} && \
+      install -d -o ${HOST_UID} -g ${HOST_GID} \
+        ${HOST_HOME}/.config \
+        ${HOST_HOME}/.cache \
+        ${HOST_HOME}/.local \
+        ${HOST_HOME}/.local/share \
+        ${HOST_HOME}/.local/state; \
     fi
+
+# ^ The install -d matters: when a bind-mount destination's parent dirs are
+# missing, the Docker daemon creates them ROOT-owned. The ~/.local/share/*
+# and ~/.config/* mounts would leave ~/.local, ~/.local/share, and ~/.config
+# root-owned, and any agent writing a SIBLING XDG path (opencode mkdirs
+# ~/.local/state for its logs) then fails with EACCES. Pre-creating them
+# user-owned in the image means Docker finds them and creates nothing.
 
 # Rust toolchain: conditionally baked into the image for Windows hosts,
 # or mounted from the host for native Linux/Unix hosts.
@@ -238,6 +257,12 @@ ENV ARBOX_INSIDE=1
 # early-returns when this env var is truthy.)
 ENV DISABLE_AUTOUPDATER=1
 ENV DISABLE_INSTALLATION_CHECKS=1
+
+# Same posture for opencode: its version is baked into the image and bumped
+# via `arbox update`, so its self-updater must not run in here. Equivalent to
+# `autoupdate: false` in opencode.json, but as an env var it doesn't touch
+# the user's mounted config.
+ENV OPENCODE_DISABLE_AUTOUPDATE=true
 
 USER ${HOST_USER}
 WORKDIR ${HOST_HOME}

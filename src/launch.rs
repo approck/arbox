@@ -72,6 +72,12 @@ const AGENT_STATE: &[&str] = &[
     ".claude.json",
     // codex
     ".codex",
+    // opencode: global config (opencode.json, themes, agents, commands) under
+    // ~/.config/opencode; auth tokens + session storage under
+    // ~/.local/share/opencode (auth.json, storage/). Data only — opencode's
+    // binary is baked into the image like the rest.
+    ".config/opencode",
+    ".local/share/opencode",
     // agy: Antigravity reuses the Gemini namespace for skills/MCP/GEMINI.md,
     // with per-host config under ~/.config/antigravity.
     ".gemini",
@@ -251,6 +257,7 @@ fn ensure_agent_state(host: &HostContext, agent: &str, profile: Option<&str>) ->
     let dirs: Vec<&str> = match agent {
         "claude" => vec![".claude"],
         "codex" => vec![".codex"],
+        "opencode" => vec![".config/opencode", ".local/share/opencode"],
         "agy" => vec![".gemini", ".config/antigravity"],
         "grok" => vec![".grok"],
         _ => vec![],
@@ -326,6 +333,22 @@ pub fn run_codex(extra: Vec<String>, opts: Opts) -> Result<ExitCode> {
     run(host, argv, opts)
 }
 
+pub fn run_opencode(extra: Vec<String>, opts: Opts) -> Result<ExitCode> {
+    let host = host::detect()?;
+    host::require_git(&host)?;
+    ensure_agent_state(&host, "opencode", opts.profile.as_deref())?;
+    // opencode has no approval-bypass flag to inject — its default permission
+    // posture is already permissive, and tightening it lives in the user's
+    // mounted ~/.config/opencode/opencode.json. Auth is file-based
+    // (~/.local/share/opencode/auth.json), no keyring needed, so `opencode
+    // auth login` inside the box persists via the state mount. Local
+    // providers on the host (e.g. Ollama on localhost:11434) are reachable
+    // because the container runs with --network host.
+    let mut argv = vec!["opencode".to_string()];
+    argv.extend(extra);
+    run(host, argv, opts)
+}
+
 pub fn run_agy(extra: Vec<String>, opts: Opts) -> Result<ExitCode> {
     let host = host::detect()?;
     host::require_git(&host)?;
@@ -390,7 +413,7 @@ pub fn run_argv(argv: Vec<String>, opts: Opts) -> Result<ExitCode> {
 /// its profile tree ready; a no-op without a profile.
 fn ensure_all_agent_state(host: &HostContext, profile: Option<&str>) -> Result<()> {
     if profile.is_some() {
-        for agent in ["claude", "codex", "agy", "grok"] {
+        for agent in ["claude", "codex", "opencode", "agy", "grok"] {
             ensure_agent_state(host, agent, profile)?;
         }
     }
