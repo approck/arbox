@@ -108,13 +108,15 @@ On a `0` return, check `GetLastError() == ERROR_INSUFFICIENT_BUFFER` and retry
 once using the `size` the call wrote back, instead of failing outright. Low
 likelihood (needs a >255-char account name) but cheap to make correct.
 
-### 3c. ⬜🟡 Dockerfile `USER`/`WORKDIR` reference an uncreated user on Windows (finding #9)
-**Where:** `src/Dockerfile` (lines ~242–243) + `src/image.rs` build-args.
-On a Windows build the user-creation `RUN` is skipped, so `USER ${HOST_USER}` /
-`WORKDIR ${HOST_HOME}` point at a user/home that doesn't exist. Benign today
-(arbox always passes `--user 1000:1000` and `--workdir`), so this is defensive.
+### 3c. ⬜🟡 Dockerfile `USER` references an uncreated user on Windows (finding #9)
+**Where:** `src/Dockerfile` (`USER ${HOST_USER}` near the end) + `src/image.rs` build-args.
+On a Windows build the user-creation `RUN` is skipped, so `USER ${HOST_USER}`
+points at a user that doesn't exist. (The `WORKDIR ${HOST_HOME}` half of this
+finding is fixed: the unconditional `install -d` now pre-creates `${HOST_HOME}`
+and the XDG dirs user-owned on every platform.) Benign today (arbox always
+passes `--user 1000:1000` and `--workdir`), so this is defensive.
 Option: pass a `RUNTIME_USER` build-arg that is the host user on Linux and
-`ubuntu` (uid 1000 in noble) on Windows; use it for `USER`/`WORKDIR`.
+`ubuntu` (uid 1000 in noble) on Windows; use it for `USER`.
 
 ### 3d. ⬜🟡 Cross-drive worktree silently breaks (finding #6/#8)
 **Where:** `src/launch.rs` — `fixup_windows_worktree`.
@@ -130,7 +132,7 @@ absolute Windows `gitdir:` that won't resolve in the container. At minimum
 ### ⬜ `ANTHROPIC_API_KEY` passthrough scope
 **Where:** `src/launch.rs` — `run()` (the `if let Ok(key) = std::env::var(...)`).
 The windows PR forwards the host's `ANTHROPIC_API_KEY` into **every** verb
-(bash/grok/codex/agy), on all platforms. If that's intended, leave it. If the
+(bash/grok/codex/opencode/agy/playwright/run), on all platforms. If that's intended, leave it. If the
 key should only reach claude, gate it (or drop it and rely on mounted
 credentials). One-line change either way.
 

@@ -77,7 +77,8 @@ pub fn require_supported_distro(host: &HostContext) -> Result<()> {
     Ok(())
 }
 
-/// Demand a git workspace for verbs that need one (claude/codex/bash/run).
+/// Demand a git workspace for the launch verbs — every verb except
+/// `status`/`update`/`clean` requires one.
 /// Returns the workspace root and common git dir as a borrowed pair.
 pub fn require_git(host: &HostContext) -> Result<(&Path, &Path)> {
     let workspace = host.workspace_root.as_deref().ok_or_else(|| {

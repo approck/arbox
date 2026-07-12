@@ -65,8 +65,9 @@ enum Cmd {
     /// themes, agents) and ~/.local/share/opencode (auth.json, sessions)
     /// mount from the host. No approval-bypass flag exists or is needed —
     /// opencode defaults to permissive permissions. Host-local providers
-    /// (e.g. Ollama on localhost:11434) work because the container uses
-    /// host networking. All trailing args forwarded.
+    /// (e.g. Ollama on localhost:11434) work on Linux via host networking;
+    /// on Windows, Docker Desktop reaches them only with its opt-in
+    /// host-networking feature enabled. All trailing args forwarded.
     Opencode {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,

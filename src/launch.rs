@@ -60,35 +60,129 @@ impl MountSpec {
     }
 }
 
-/// Home-relative state paths owned by each coding agent. Whole-tree redirected
-/// into the profile dir under `--profile`, or mounted at the standard home
-/// location by default. Listing the data dirs (not the binaries — those are
-/// baked into the image at /usr/local/bin) is what persists credentials,
-/// history, skills, MCP config, memories, and sessions across container runs.
-const AGENT_STATE: &[&str] = &[
+/// One coding agent's registry entry. This table is the single source of
+/// truth for the per-agent state layout: `mount_specs` derives the mount list
+/// from it, `ensure_agent_state` pre-creates its paths, and
+/// `ensure_all_agent_state` iterates its names — add an agent (or move a
+/// path) here and every consumer follows. The Dockerfile's XDG parent-dir
+/// pre-creation (`install -d` in src/Dockerfile) must cover the parents of
+/// any nested path listed here.
+struct AgentSpec {
+    /// Verb name — identical to the binary name inside the image.
+    name: &'static str,
+    /// Home-relative state dirs, mounted RW and pre-created on first launch.
+    dirs: &'static [&'static str],
+    /// State FILES seeded with initial contents so the bind mount has a
+    /// source to attach to (a missing source would be silently skipped,
+    /// making the file ephemeral in the container).
+    seed_files: &'static [(&'static str, &'static str)],
+    /// The agent resolves its dirs through the XDG base-dir spec on the host
+    /// (honors XDG_CONFIG_HOME / XDG_DATA_HOME), so the host-side mount
+    /// sources must resolve the same way.
+    xdg: bool,
+}
+
+/// Per-agent state registry. Whole-tree redirected into the profile dir under
+/// `--profile`, or mounted at the standard host location by default. Listing
+/// the data paths (not the binaries — those are baked into the image at
+/// /usr/local/bin) is what persists credentials, history, skills, MCP config,
+/// memories, and sessions across container runs.
+const AGENTS: &[AgentSpec] = &[
     // claude: the .claude/ dir (sessions, memories, settings, credentials,
-    // plans, tasks) plus the .claude.json config/auth-identity file beside it.
-    ".claude",
-    ".claude.json",
-    // codex
-    ".codex",
+    // plans, tasks) plus the .claude.json config/auth-identity file beside
+    // it, seeded with `{}` (parseable JSON) so claude's first load doesn't
+    // choke on a zero-byte mount target.
+    AgentSpec {
+        name: "claude",
+        dirs: &[".claude"],
+        seed_files: &[(".claude.json", "{}\n")],
+        xdg: false,
+    },
+    AgentSpec {
+        name: "codex",
+        dirs: &[".codex"],
+        seed_files: &[],
+        xdg: false,
+    },
     // opencode: global config (opencode.json, themes, agents, commands) under
     // ~/.config/opencode; auth tokens + session storage under
-    // ~/.local/share/opencode (auth.json, storage/). Data only — opencode's
-    // binary is baked into the image like the rest.
-    ".config/opencode",
-    ".local/share/opencode",
+    // ~/.local/share/opencode (auth.json, storage/). The opencode BINARY is
+    // baked into the image, but its data dir is not purely inert state:
+    // opencode downloads helper executables (LSP servers, ripgrep, fzf) into
+    // ~/.local/share/opencode/bin, so this RW mount carries executables in
+    // both directions.
+    AgentSpec {
+        name: "opencode",
+        dirs: &[".config/opencode", ".local/share/opencode"],
+        seed_files: &[],
+        xdg: true,
+    },
     // agy: Antigravity reuses the Gemini namespace for skills/MCP/GEMINI.md,
-    // with per-host config under ~/.config/antigravity.
-    ".gemini",
-    ".config/antigravity",
-    // grok
-    ".grok",
+    // with per-host config under ~/.config/antigravity. Not known to honor
+    // XDG overrides — the ~/.config path is fixed.
+    AgentSpec {
+        name: "agy",
+        dirs: &[".gemini", ".config/antigravity"],
+        seed_files: &[],
+        xdg: false,
+    },
+    AgentSpec {
+        name: "grok",
+        dirs: &[".grok"],
+        seed_files: &[],
+        xdg: false,
+    },
 ];
+
+/// Flat view of every home-relative state path in the registry, paired with
+/// its agent's XDG flag. Drives the mount list and the tests.
+fn agent_state_paths() -> impl Iterator<Item = (&'static str, bool)> {
+    AGENTS.iter().flat_map(|a| {
+        a.dirs
+            .iter()
+            .copied()
+            .chain(a.seed_files.iter().map(|(rel, _)| *rel))
+            .map(move |rel| (rel, a.xdg))
+    })
+}
 
 /// Root of a named profile's isolated state tree on the host.
 fn profile_root(home: &Path, name: &str) -> PathBuf {
     home.join(".arbox").join("profiles").join(name)
+}
+
+/// Resolve where an agent state path actually lives on the HOST.
+///
+/// Under `--profile` everything roots at the profile dir (XDG overrides are
+/// deliberately ignored — the profile tree is arbox's own layout). Otherwise
+/// XDG-aware entries resolve through the host's XDG base dirs, falling back
+/// to the literal home-relative path. The container side always uses the
+/// home-relative default: no XDG vars are forwarded inside, so the
+/// in-container layout stays fixed while the host source follows wherever
+/// the host's own agent actually keeps its state.
+fn state_source(home: &Path, rel: &str, xdg: bool, profile: Option<&str>) -> PathBuf {
+    match profile {
+        Some(p) => profile_root(home, p).join(rel),
+        None if xdg => {
+            xdg_override(rel, &|var| std::env::var_os(var)).unwrap_or_else(|| home.join(rel))
+        }
+        None => home.join(rel),
+    }
+}
+
+/// XDG base-dir override for `rel`, if the matching env var holds an
+/// absolute path (the basedir spec says relative values must be ignored).
+/// None means "use the default location".
+fn xdg_override(rel: &str, get: &dyn Fn(&str) -> Option<std::ffi::OsString>) -> Option<PathBuf> {
+    let (var, suffix) = if let Some(s) = rel.strip_prefix(".config/") {
+        ("XDG_CONFIG_HOME", s)
+    } else if let Some(s) = rel.strip_prefix(".local/share/") {
+        ("XDG_DATA_HOME", s)
+    } else {
+        return None;
+    };
+    let base = PathBuf::from(get(var)?);
+    base.is_absolute().then(|| base.join(suffix))
 }
 
 /// Build the bind-mount list. With no `profile`, agent state mounts at the
@@ -141,19 +235,16 @@ pub fn mount_specs(host: &HostContext, profile: Option<&str>) -> Vec<MountSpec> 
     // Agent state dirs/files — mounted RW and optional. `ensure_agent_state`
     // pre-creates the relevant sources on first launch of each agent verb, so
     // these mounts reliably attach without any host-side prep. Under a profile
-    // the source moves into the profile dir while the destination (what the
-    // agent sees) stays canonical.
-    for rel in AGENT_STATE {
+    // the source moves into the profile dir, and for XDG-aware agents it
+    // follows the host's XDG base dirs; the destination (what the agent sees
+    // in the container) always stays canonical.
+    for (rel, xdg) in agent_state_paths() {
         let dst = h.join(rel);
-        match profile {
-            None => specs.push(MountSpec::new(dst, false, false, None)),
-            Some(p) => specs.push(MountSpec::redirected(
-                profile_root(h, p).join(rel),
-                dst,
-                false,
-                false,
-                None,
-            )),
+        let src = state_source(h, rel, xdg, profile);
+        if src == dst {
+            specs.push(MountSpec::new(dst, false, false, None));
+        } else {
+            specs.push(MountSpec::redirected(src, dst, false, false, None));
         }
     }
 
@@ -242,38 +333,28 @@ fn fixup_windows_worktree(host: &HostContext) -> Result<Option<String>> {
 /// Pre-create the host-side state paths an agent will write into, so the
 /// bind mount has something to attach to on first run. Without this, Docker
 /// silently skips missing-source mounts and the agent runs with ephemeral
-/// state every launch. Each call is per-verb — only the dirs the specific
-/// agent uses are touched.
+/// state every launch. Each call is per-verb — only the paths the specific
+/// agent's `AGENTS` entry lists are touched.
 ///
-/// `profile` only changes WHERE these paths are rooted: the home directory for
-/// the default, or `~/.arbox/profiles/NAME/` for a named profile. The layout
-/// underneath (`.claude/`, `.claude.json`, …) is identical either way, which is
-/// what lets the profile dir stand in as a self-contained agent home.
+/// `profile` only changes WHERE these paths are rooted: the home directory
+/// (or the host's XDG base dirs, for XDG-aware agents) by default, or
+/// `~/.arbox/profiles/NAME/` for a named profile. The layout underneath
+/// (`.claude/`, `.claude.json`, …) is identical either way, which is what
+/// lets the profile dir stand in as a self-contained agent home.
 fn ensure_agent_state(host: &HostContext, agent: &str, profile: Option<&str>) -> Result<()> {
-    let base = match profile {
-        None => host.home.clone(),
-        Some(p) => profile_root(&host.home, p),
+    let Some(spec) = AGENTS.iter().find(|a| a.name == agent) else {
+        return Ok(());
     };
-    let dirs: Vec<&str> = match agent {
-        "claude" => vec![".claude"],
-        "codex" => vec![".codex"],
-        "opencode" => vec![".config/opencode", ".local/share/opencode"],
-        "agy" => vec![".gemini", ".config/antigravity"],
-        "grok" => vec![".grok"],
-        _ => vec![],
-    };
-    for rel in &dirs {
-        let d = base.join(rel);
+    for rel in spec.dirs {
+        let d = state_source(&host.home, rel, spec.xdg, profile);
         std::fs::create_dir_all(&d).with_context(|| format!("creating {}", d.display()))?;
     }
-    // Claude's main config + auth state is a FILE next to its dir. Initialize
-    // with `{}` (parseable JSON) so claude's first load doesn't choke on a
-    // zero-byte mount target, and so the file exists for the bind mount to
-    // attach to (a missing source would be skipped, making it ephemeral).
-    if agent == "claude" {
-        let cj = base.join(".claude.json");
-        if !cj.exists() {
-            std::fs::write(&cj, "{}\n").with_context(|| format!("creating {}", cj.display()))?;
+    // Seeded files (claude's .claude.json) get initial contents so the
+    // agent's first load doesn't choke on a zero-byte mount target.
+    for (rel, contents) in spec.seed_files {
+        let f = state_source(&host.home, rel, spec.xdg, profile);
+        if !f.exists() {
+            std::fs::write(&f, contents).with_context(|| format!("creating {}", f.display()))?;
         }
     }
     Ok(())
@@ -281,7 +362,7 @@ fn ensure_agent_state(host: &HostContext, agent: &str, profile: Option<&str>) ->
 
 /// Per-invocation launch options shared by every verb: the user's extra
 /// bind-mount paths and the optional `--profile` name. Bundled so adding a
-/// cross-cutting knob doesn't ripple through seven function signatures.
+/// cross-cutting knob doesn't ripple through every verb function's signature.
 #[derive(Default)]
 pub struct Opts {
     pub rw: Vec<PathBuf>,
@@ -307,52 +388,54 @@ pub fn validate_profile_name(name: &str) -> Result<()> {
     Ok(())
 }
 
-pub fn run_claude(extra: Vec<String>, opts: Opts) -> Result<ExitCode> {
+/// Shared skeleton for every agent verb: detect the host, demand a git
+/// workspace, pre-create the agent's state paths, then run the agent's
+/// binary (same name as the verb) with `injected` flags ahead of the user's
+/// trailing args.
+fn run_agent(
+    agent: &'static str,
+    injected: &[&str],
+    extra: Vec<String>,
+    opts: Opts,
+) -> Result<ExitCode> {
     let host = host::detect()?;
     host::require_git(&host)?;
-    ensure_agent_state(&host, "claude", opts.profile.as_deref())?;
-    // The container IS the sandbox, so granting claude full permissions
-    // inside is the correct posture.
-    let mut argv = vec![
-        "claude".to_string(),
-        "--dangerously-skip-permissions".to_string(),
-    ];
+    ensure_agent_state(&host, agent, opts.profile.as_deref())?;
+    let mut argv = vec![agent.to_string()];
+    argv.extend(injected.iter().map(|f| f.to_string()));
     argv.extend(extra);
     run(host, argv, opts)
+}
+
+pub fn run_claude(extra: Vec<String>, opts: Opts) -> Result<ExitCode> {
+    // The container IS the sandbox, so granting claude full permissions
+    // inside is the correct posture.
+    run_agent("claude", &["--dangerously-skip-permissions"], extra, opts)
 }
 
 pub fn run_codex(extra: Vec<String>, opts: Opts) -> Result<ExitCode> {
-    let host = host::detect()?;
-    host::require_git(&host)?;
-    ensure_agent_state(&host, "codex", opts.profile.as_deref())?;
-    let mut argv = vec![
-        "codex".to_string(),
-        "--dangerously-bypass-approvals-and-sandbox".to_string(),
-    ];
-    argv.extend(extra);
-    run(host, argv, opts)
+    run_agent(
+        "codex",
+        &["--dangerously-bypass-approvals-and-sandbox"],
+        extra,
+        opts,
+    )
 }
 
 pub fn run_opencode(extra: Vec<String>, opts: Opts) -> Result<ExitCode> {
-    let host = host::detect()?;
-    host::require_git(&host)?;
-    ensure_agent_state(&host, "opencode", opts.profile.as_deref())?;
     // opencode has no approval-bypass flag to inject — its default permission
     // posture is already permissive, and tightening it lives in the user's
     // mounted ~/.config/opencode/opencode.json. Auth is file-based
     // (~/.local/share/opencode/auth.json), no keyring needed, so `opencode
     // auth login` inside the box persists via the state mount. Local
     // providers on the host (e.g. Ollama on localhost:11434) are reachable
-    // because the container runs with --network host.
-    let mut argv = vec!["opencode".to_string()];
-    argv.extend(extra);
-    run(host, argv, opts)
+    // on Linux, where --network host is the real host network; on Windows,
+    // Docker Desktop only honors --network host with its opt-in
+    // host-networking feature enabled.
+    run_agent("opencode", &[], extra, opts)
 }
 
 pub fn run_agy(extra: Vec<String>, opts: Opts) -> Result<ExitCode> {
-    let host = host::detect()?;
-    host::require_git(&host)?;
-    ensure_agent_state(&host, "agy", opts.profile.as_deref())?;
     // No documented `--dangerously-*` / `--yolo` flag for Antigravity yet —
     // forward args verbatim. The Docker boundary is still the sandbox; agy
     // itself just runs with whatever approval mode it defaults to. Note
@@ -360,22 +443,15 @@ pub fn run_agy(extra: Vec<String>, opts: Opts) -> Result<ExitCode> {
     // first-time auth typically goes through agy's SSH-style URL+code flow.
     // Under `--profile`, agy's whole ~/.gemini + ~/.config/antigravity move
     // into the profile tree, so whatever it persists there is isolated too.
-    let mut argv = vec!["agy".to_string()];
-    argv.extend(extra);
-    run(host, argv, opts)
+    run_agent("agy", &[], extra, opts)
 }
 
 pub fn run_grok(extra: Vec<String>, opts: Opts) -> Result<ExitCode> {
-    let host = host::detect()?;
-    host::require_git(&host)?;
-    ensure_agent_state(&host, "grok", opts.profile.as_deref())?;
     // Grok Build's safety story is its plan-mode review, not a global
     // approval-bypass flag — forward args verbatim. Auth lives in
     // ~/.grok/auth.json (file-based, no keyring dependency), which the
     // ~/.grok mount in `mount_specs` persists across runs.
-    let mut argv = vec!["grok".to_string()];
-    argv.extend(extra);
-    run(host, argv, opts)
+    run_agent("grok", &[], extra, opts)
 }
 
 pub fn run_playwright(extra: Vec<String>, opts: Opts) -> Result<ExitCode> {
@@ -413,8 +489,8 @@ pub fn run_argv(argv: Vec<String>, opts: Opts) -> Result<ExitCode> {
 /// its profile tree ready; a no-op without a profile.
 fn ensure_all_agent_state(host: &HostContext, profile: Option<&str>) -> Result<()> {
     if profile.is_some() {
-        for agent in ["claude", "codex", "opencode", "agy", "grok"] {
-            ensure_agent_state(host, agent, profile)?;
+        for a in AGENTS {
+            ensure_agent_state(host, a.name, profile)?;
         }
     }
     Ok(())
@@ -623,11 +699,19 @@ mod tests {
     #[test]
     fn default_mounts_agent_state_at_home() {
         let specs = mount_specs(&fake_host(), None);
-        // Every agent state path mounts same-path (shared with the host).
-        for rel in AGENT_STATE {
+        // Every agent state path mounts at its canonical home destination,
+        // same-path (shared with the host) — except that XDG-aware entries
+        // legitimately redirect when the test environment itself carries
+        // XDG_CONFIG_HOME/XDG_DATA_HOME overrides, so only pin those down
+        // when the environment is clean.
+        let xdg_env_set = std::env::var_os("XDG_CONFIG_HOME").is_some()
+            || std::env::var_os("XDG_DATA_HOME").is_some();
+        for (rel, xdg) in agent_state_paths() {
             let m = dst(&specs, &format!("/home/jason/{rel}"))
                 .unwrap_or_else(|| panic!("missing mount for {rel}"));
-            assert_eq!(m.src, m.dst, "{rel} must be a same-path (shared) mount");
+            if !xdg || !xdg_env_set {
+                assert_eq!(m.src, m.dst, "{rel} must be a same-path (shared) mount");
+            }
         }
     }
 
@@ -637,7 +721,8 @@ mod tests {
 
         // Every agent state path — dirs and the .claude.json file alike — is
         // sourced from the profile dir while the destination stays canonical.
-        for rel in AGENT_STATE {
+        // XDG overrides must NOT apply under a profile.
+        for (rel, _) in agent_state_paths() {
             let m = dst(&specs, &format!("/home/jason/{rel}"))
                 .unwrap_or_else(|| panic!("missing mount for {rel}"));
             assert_eq!(
@@ -659,6 +744,30 @@ mod tests {
             let m = dst(&specs, d).unwrap();
             assert_eq!(m.src, m.dst, "{d} must stay shared across profiles");
         }
+    }
+
+    // Path::is_absolute has Windows semantics ("/xdg" isn't absolute there);
+    // XDG resolution is a Unix concern, so pin its behavior on Unix only.
+    #[cfg(not(target_family = "windows"))]
+    #[test]
+    fn xdg_override_resolution() {
+        use std::ffi::OsString;
+
+        // No env var set → no override.
+        assert_eq!(xdg_override(".config/opencode", &|_| None), None);
+
+        // Absolute XDG_DATA_HOME redirects the data dir.
+        let get = |var: &str| (var == "XDG_DATA_HOME").then(|| OsString::from("/xdg/data"));
+        assert_eq!(
+            xdg_override(".local/share/opencode", &get),
+            Some(PathBuf::from("/xdg/data/opencode"))
+        );
+        // A rel outside the XDG prefixes never resolves.
+        assert_eq!(xdg_override(".claude", &get), None);
+
+        // Relative base-dir values are invalid per the spec — ignored.
+        let rel_get = |_: &str| Some(OsString::from("relative/dir"));
+        assert_eq!(xdg_override(".config/opencode", &rel_get), None);
     }
 
     #[test]

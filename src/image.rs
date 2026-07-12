@@ -13,8 +13,10 @@ enum BuildMode {
     /// agents come out at whatever version the cached layers already hold.
     Cached,
     /// Cached build, but pass a fresh `AGENT_REFRESH` token so the five agent
-    /// layers (and only those) re-run and pull their latest versions. Every
-    /// expensive layer above the cache-bust barrier stays cached.
+    /// layers (plus the cheap user-setup steps below them) re-run and pull
+    /// their latest versions. Every expensive layer above the cache-bust
+    /// barrier — apt, node, Playwright, the Windows rustup toolchain — stays
+    /// cached.
     RefreshAgents,
     /// `--no-cache`: re-run every layer from scratch (apt, node, the
     /// Playwright browser downloads, everything).
@@ -267,7 +269,7 @@ pub fn print_status(profile: Option<&str>) -> Result<()> {
             (false, false) => "  [missing — skipped]",
         };
         // Most mounts land at the same path on both sides; show the redirect
-        // arrow only for the profile auth files where src != dst.
+        // arrow only where src != dst (profile trees, XDG-relocated state).
         if m.src == m.dst {
             println!("  {} ({mode}){suffix}", m.src.display());
         } else {

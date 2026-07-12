@@ -26,8 +26,8 @@ current git repo mounted at the same absolute path.
 ## About (LLM Generated)
 
 A Docker-based agent sandbox for running Claude Code, Codex CLI, OpenCode,
-and arbitrary build commands with a narrower view of the host than a normal
-shell.
+Antigravity, Grok Build, and arbitrary build commands with a narrower view
+of the host than a normal shell.
 
 `arbox` builds a per-host Ubuntu image from an embedded Dockerfile, mirrors
 your host uid/gid, bind-mounts the current git workspace at the same path,
@@ -63,9 +63,13 @@ or a process that you intentionally gave access to your mounted credentials.
 - **Agent data dirs are mounted read-write** so config, credentials, history,
   memories, and sessions persist across container rebuilds: `~/.claude` +
   `~/.claude.json` (claude), `~/.codex`, `~/.config/opencode` +
-  `~/.local/share/opencode` (opencode — state only, no binaries live there),
-  `~/.gemini` + `~/.config/antigravity` (agy), and `~/.grok`. A compromised
-  agent could modify these.
+  `~/.local/share/opencode` (opencode), `~/.gemini` + `~/.config/antigravity`
+  (agy), and `~/.grok`. A compromised agent could modify these. Note that
+  opencode's data dir is not purely inert state: opencode downloads helper
+  executables (LSP servers, ripgrep, fzf) into `~/.local/share/opencode/bin`,
+  so this mount carries executables in both directions — a compromised
+  container agent could tamper with binaries the host's own opencode later
+  runs.
 - **The host Wayland display socket is mounted when available** so
   `wl-paste` works for clipboard image flows. Only the socket file is
   mounted, not the full `$XDG_RUNTIME_DIR`.
@@ -127,7 +131,7 @@ arbox bash                         # interactive bash, project auto-mounted
 arbox run -- cargo test            # one-off command
 arbox claude                       # Claude Code, project auto-mounted
 arbox codex                        # Codex CLI, project auto-mounted
-arbox opencode                     # OpenCode TUI (works with local Ollama)
+arbox opencode                     # OpenCode TUI (local Ollama works on Linux)
 arbox agy                          # Google Antigravity CLI
 arbox grok                         # xAI Grok Build CLI
 ```
@@ -153,7 +157,7 @@ clear message.
 |---------------------------------|-------------|
 | `arbox claude [FLAGS] -- ARGS...` | Run Claude Code with `--dangerously-skip-permissions`. Binary baked into image; `~/.claude` + `~/.claude.json` mount from the host if present. |
 | `arbox codex  [FLAGS] -- ARGS...` | Run Codex CLI with `--dangerously-bypass-approvals-and-sandbox`. Binary baked into image; `~/.codex` mounts from the host if present. |
-| `arbox opencode [FLAGS] -- ARGS...` | Run the OpenCode TUI. Binary baked into image; `~/.config/opencode` (config) and `~/.local/share/opencode` (auth in `auth.json`, sessions) mount from the host. Host-local providers like Ollama on `localhost:11434` work thanks to host networking. |
+| `arbox opencode [FLAGS] -- ARGS...` | Run the OpenCode TUI. Binary baked into image; `~/.config/opencode` (config) and `~/.local/share/opencode` (auth in `auth.json`, sessions) mount from the host. Host-local providers like Ollama on `localhost:11434` work via host networking on Linux; on Windows, Docker Desktop reaches them only with its opt-in host-networking feature enabled. |
 | `arbox agy    [FLAGS] -- ARGS...` | Run Google Antigravity's `agy` CLI. Binary baked into image; `~/.gemini` and `~/.config/antigravity` mount from the host. First-time auth uses agy's SSH-style URL+code flow since libsecret isn't reachable inside the container. |
 | `arbox grok   [FLAGS] -- ARGS...` | Run xAI's Grok Build CLI. Binary baked into image; `~/.grok` mounts from the host (token lives in `~/.grok/auth.json`). |
 | `arbox bash   [FLAGS]`          | Open an interactive login bash inside the container. |
@@ -164,14 +168,15 @@ clear message.
 | `arbox status`                  | Show host facts, mount layout, image presence, and network mode. Works outside a git repository (skips the workspace mount in that case). |
 | `arbox clean`                   | Remove every arbox image whose tag has the current host's prefix. |
 
-`claude`, `codex`, `opencode`, `agy`, `grok`, `bash`, and `run` must be
-invoked from inside a git repository — they mount the git toplevel as the
-workspace and `cd` into your current directory. `status`, `update`, and
+`claude`, `codex`, `opencode`, `agy`, `grok`, `playwright`, `bash`, and `run`
+must be invoked from inside a git repository — they mount the git toplevel as
+the workspace and `cd` into your current directory. `status`, `update`, and
 `clean` do not require a repo.
 
 ### Extra bind-mount flags
 
-`claude`, `codex`, `opencode`, `agy`, `grok`, `bash`, and `run` accept zero or more `--rw <PATH>` and
+`claude`, `codex`, `opencode`, `agy`, `grok`, `playwright`, `bash`, and `run`
+accept zero or more `--rw <PATH>` and
 `--ro <PATH>` options. Each path is canonicalized (relative paths and
 symlinks resolve against the host filesystem) and mounted at the same
 absolute path inside the container.

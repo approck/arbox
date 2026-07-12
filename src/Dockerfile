@@ -116,16 +116,32 @@ RUN npm install -g \
  && playwright install chromium firefox \
  && chmod -R a+rX /opt/ms-playwright
 
+# Rust toolchain: conditionally baked into the image for Windows hosts, or
+# mounted from the host for native Linux/Unix hosts. On Windows, install
+# rustup inside the container; on Linux, host ~/.cargo/.rustup are mounted at
+# runtime and this RUN is a cheap no-op. Lives ABOVE the agent cache-bust
+# barrier because the toolchain download is expensive and must stay cached
+# across `arbox update` runs.
+ARG WINDOWS_HOST=false
+ARG CARGO_HOME=/root/.cargo
+ARG RUSTUP_HOME=/root/.rustup
+ENV CARGO_HOME=${CARGO_HOME}
+ENV RUSTUP_HOME=${RUSTUP_HOME}
+RUN if [ "${WINDOWS_HOST}" = "true" ]; then \
+      curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable && \
+      chmod -R 777 /usr/local/cargo /usr/local/rustup; \
+    fi
+
 # Cache-bust barrier for the five agent layers below. `arbox update` passes a
 # fresh value here (a unix timestamp) as a --build-arg, which invalidates this
 # layer and therefore every layer after it — the claude/codex/opencode/agy/grok
 # installs re-run and pull their latest published versions, while every
 # expensive layer ABOVE this point (apt, uv, deno, node, the ~700 MB
-# Playwright browser downloads) stays cached. The default 0 keeps ordinary
-# cached builds (the auto-bootstrap on first launch, `arbox update --force`'s
-# --no-cache pass) unaffected: the agents only move when you run `arbox
-# update`. This barrier MUST stay below the last expensive layer and above the
-# first agent install.
+# Playwright browser downloads, the Windows-host rustup toolchain) stays
+# cached. The default 0 keeps ordinary cached builds (the auto-bootstrap on
+# first launch, `arbox update --force`'s --no-cache pass) unaffected: the
+# agents only move when you run `arbox update`. This barrier MUST stay below
+# the last expensive layer and above the first agent install.
 ARG AGENT_REFRESH=0
 RUN echo "arbox agent refresh token: ${AGENT_REFRESH}" >/dev/null
 
@@ -179,11 +195,10 @@ RUN mkdir -p /tmp/grok-stage \
  && chmod +x /usr/local/bin/grok \
  && rm -rf /tmp/grok-stage /tmp/grok-install.sh
 
-ARG WINDOWS_HOST=false
 # Mirror the host user/group exactly.
 # Most ubuntu:<codename> base images ship a default user at uid 1000;
 # rename that entry instead of failing on conflict.
-# Skipped for windows.
+# Skipped for windows (no matching host user exists to mirror).
 RUN if [ "${WINDOWS_HOST}" = "false" ]; then \
       if getent group ${HOST_GID} >/dev/null; then \
           groupmod -n ${HOST_USER} $(getent group ${HOST_GID} | cut -d: -f1); \
@@ -197,37 +212,34 @@ RUN if [ "${WINDOWS_HOST}" = "false" ]; then \
           useradd -u ${HOST_UID} -g ${HOST_GID} -d ${HOST_HOME} -m -s /bin/bash ${HOST_USER}; \
       fi && \
       echo "${HOST_USER} ALL=(ALL) NOPASSWD: ALL" > /etc/sudoers.d/${HOST_USER} && \
-      chmod 440 /etc/sudoers.d/${HOST_USER} && \
-      install -d -o ${HOST_UID} -g ${HOST_GID} \
-        ${HOST_HOME}/.config \
-        ${HOST_HOME}/.cache \
-        ${HOST_HOME}/.local \
-        ${HOST_HOME}/.local/share \
-        ${HOST_HOME}/.local/state; \
+      chmod 440 /etc/sudoers.d/${HOST_USER}; \
     fi
 
-# ^ The install -d matters: when a bind-mount destination's parent dirs are
-# missing, the Docker daemon creates them ROOT-owned. The ~/.local/share/*
-# and ~/.config/* mounts would leave ~/.local, ~/.local/share, and ~/.config
-# root-owned, and any agent writing a SIBLING XDG path (opencode mkdirs
-# ~/.local/state for its logs) then fails with EACCES. Pre-creating them
-# user-owned in the image means Docker finds them and creates nothing.
-
-# Rust toolchain: conditionally baked into the image for Windows hosts,
-# or mounted from the host for native Linux/Unix hosts.
-# On Windows, install rustup inside the container. On Linux, mount host ~/.cargo/.rustup.
-ARG CARGO_HOME=/root/.cargo
-ARG RUSTUP_HOME=/root/.rustup
-ENV CARGO_HOME=${CARGO_HOME}
-ENV RUSTUP_HOME=${RUSTUP_HOME}
-RUN if [ "${WINDOWS_HOST}" = "true" ]; then \
-      curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable && \
-      chmod -R 777 /usr/local/cargo /usr/local/rustup; \
-    fi
+# Pre-create HOME and the standard XDG dirs, user-owned, on EVERY platform
+# (containers run as --user ${HOST_UID}:${HOST_GID} regardless of host OS).
+# Two distinct reasons:
+#   1. Mount parents: when a bind-mount destination's parent dirs are
+#      missing, the Docker daemon creates them ROOT-owned. ~/.config and
+#      ~/.local + ~/.local/share are parents of the opencode/antigravity
+#      state mounts — keep this list covering the parents of every nested
+#      path in AGENTS (src/launch.rs). On Windows even ${HOST_HOME} itself
+#      doesn't exist yet (the user-mirror RUN above is skipped there).
+#   2. Runtime writes: agents write sibling XDG paths that are never mounted
+#      (opencode puts TUI state in ~/.local/state and caches in ~/.cache);
+#      those writes EACCES if the dirs come up root-owned.
+# On Linux, useradd -m already created ${HOST_HOME}; install -d then merely
+# re-asserts ownership on it and adds the XDG dirs.
+RUN install -d -o ${HOST_UID} -g ${HOST_GID} \
+      ${HOST_HOME} \
+      ${HOST_HOME}/.config \
+      ${HOST_HOME}/.cache \
+      ${HOST_HOME}/.local \
+      ${HOST_HOME}/.local/share \
+      ${HOST_HOME}/.local/state
 
 # Set up PATH: include both container-installed (Windows) and host-mounted (Linux) paths.
-# Ordering matters: /usr/local/bin (where the baked-in claude/codex/agy/grok/
-# playwright/node/uv/deno live) MUST come before ${HOST_HOME}/.local/bin,
+# Ordering matters: /usr/local/bin (where the baked-in claude/codex/opencode/
+# agy/grok/playwright/node/uv/deno live) MUST come before ${HOST_HOME}/.local/bin,
 # which is bind-mounted read-only from the host at runtime. If ~/.local/bin
 # were first (as it once was), a stale host install like
 # ~/.local/bin/claude -> ~/.local/share/claude/versions/X would shadow the
