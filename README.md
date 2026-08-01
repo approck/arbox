@@ -73,6 +73,14 @@ or a process that you intentionally gave access to your mounted credentials.
 - **The host Wayland display socket is mounted when available** so
   `wl-paste` works for clipboard image flows. Only the socket file is
   mounted, not the full `$XDG_RUNTIME_DIR`.
+- **Audio is NOT bound unless you pass `--voice`.** With the flag, the
+  container gets the host's PulseAudio/PipeWire socket and/or the ALSA
+  devices under `/dev/snd` — that is a live microphone and speakers for
+  whatever runs inside, so it stays opt-in and per-invocation. Passing
+  `/dev/snd` also adds the device nodes' owning group (usually `audio`) as a
+  supplementary group inside the container, which grants that access even if
+  your host user isn't in that group. See
+  [Audio](#audio---voice).
 - **Host UID/GID are mirrored** so files written from the container are owned
   by you on the host.
 - **The container uses host networking** (`--network host`) because coding
@@ -155,7 +163,7 @@ clear message.
 
 | Command                         | Description |
 |---------------------------------|-------------|
-| `arbox claude [FLAGS] -- ARGS...` | Run Claude Code with `--dangerously-skip-permissions`. Binary baked into image; `~/.claude` + `~/.claude.json` mount from the host if present. |
+| `arbox claude [FLAGS] -- ARGS...` | Run Claude Code with `--dangerously-skip-permissions`. Binary baked into image; `~/.claude` + `~/.claude.json` mount from the host if present. With `--voice`, starts with voice mode already enabled. |
 | `arbox codex  [FLAGS] -- ARGS...` | Run Codex CLI with `--dangerously-bypass-approvals-and-sandbox`. Binary baked into image; `~/.codex` mounts from the host if present. |
 | `arbox opencode [FLAGS] -- ARGS...` | Run the OpenCode TUI. Binary baked into image; `~/.config/opencode` (config) and `~/.local/share/opencode` (auth in `auth.json`, sessions) mount from the host. Host-local providers like Ollama on `localhost:11434` work via host networking on Linux; on Windows, Docker Desktop reaches them only with its opt-in host-networking feature enabled. |
 | `arbox agy    [FLAGS] -- ARGS...` | Run Google Antigravity's `agy` CLI. Binary baked into image; `~/.gemini` and `~/.config/antigravity` mount from the host. First-time auth uses agy's SSH-style URL+code flow since libsecret isn't reachable inside the container. |
@@ -165,7 +173,7 @@ clear message.
 | `arbox run    [FLAGS] -- CMD...`  | Run a one-off command inside the container. |
 | `arbox update`                  | Refresh the baked-in agents (claude, codex, opencode, agy, grok) to their latest published versions, rebuilding only the agent layers (quick — the apt/node/playwright layers stay cached). Builds the image from scratch if it doesn't exist yet. |
 | `arbox update --force`          | Full clean rebuild of the entire image (`--no-cache`): re-runs apt, node, the Playwright browser downloads, everything. |
-| `arbox status`                  | Show host facts, mount layout, image presence, and network mode. Works outside a git repository (skips the workspace mount in that case). |
+| `arbox status`                  | Show host facts, mount layout, image presence, network mode, and detected host audio. Works outside a git repository (skips the workspace mount in that case). |
 | `arbox clean`                   | Remove every arbox image whose tag has the current host's prefix. |
 
 `claude`, `codex`, `opencode`, `agy`, `grok`, `playwright`, `bash`, and `run`
@@ -188,6 +196,52 @@ arbox claude --rw ~/code/sibling-repo --ro ~/datasets/fixtures
 ```
 
 Required to exist on the host; launches fail loudly if a path is missing.
+
+### Audio (`--voice`)
+
+No sound reaches the container by default. Pass `--voice` (global, on any
+launch verb) to bind the host's audio hardware in — needed for microphone
+input, for TTS playback, and for media tests:
+
+```bash
+arbox claude --voice          # voice mode already on; hold space to talk
+arbox bash --voice            # then: rec /tmp/t.wav trim 0 3 && play /tmp/t.wav
+arbox --voice run -- pactl info
+```
+
+On `arbox claude` the flag also switches Claude Code's voice mode on for that
+session, so push-to-talk works immediately without running `/voice` first.
+Claude Code has no voice CLI flag — voice is a setting (`voice.enabled`) that
+`/voice` writes into `~/.claude/settings.json`, and that file is mounted from
+the host, so toggling it inside the box would flip voice on for your host's
+claude too. arbox instead passes `--settings '{"voice":{"enabled":true}}'`,
+which layers onto the effective settings for that run only and leaves your
+`voice.mode` (hold vs tap) preference alone. The other agents get the audio
+devices but no equivalent switch.
+
+arbox binds whichever of these the host actually has:
+
+| Host thing                                          | How it's passed |
+|-----------------------------------------------------|-----------------|
+| PulseAudio / PipeWire socket (`$PULSE_SERVER`, else `$XDG_RUNTIME_DIR/pulse/native`, else `/run/user/<uid>/pulse/native`) | Bind-mounted at the same path, with `PULSE_SERVER` pointed at it. The auth cookie (`$PULSE_COOKIE`, else `~/.config/pulse/cookie`) comes along read-only when present. Only the unix-socket form of `$PULSE_SERVER` is bindable: if yours names a remote `tcp:` server, arbox treats it as "no socket" rather than silently substituting a local one. |
+| ALSA devices `/dev/snd`                             | `--device /dev/snd`, plus `--group-add` for the group owning those nodes — `--user UID:GID` drops the host user's supplementary groups, so without it the mode-0660 device nodes stay unopenable. |
+
+The socket route is the normal one on a desktop session and needs no device
+access at all. `--voice` fails immediately (before any image build) when the
+host has neither — a headless box, a session with no sound server running, or
+a nested container without `/dev/snd`. `arbox status` reports what it can see:
+
+```
+audio:   sound server socket /run/user/1000/pulse/native (bound only with --voice)
+```
+
+The image ships the userspace side: `sox` (its `rec`/`play` front-ends are
+what `/voice` records with), `alsa-utils` and `pulseaudio-utils` for poking at
+devices, and an ALSA config that routes the default PCM through PulseAudio
+with a fallback to real hardware, so ALSA-only callers work in either mode.
+
+`--voice` is Linux-only; on Windows it errors out, since Docker Desktop has no
+way to hand host sound devices to a Linux container.
 
 ### Auth profiles (`--profile`)
 
@@ -294,7 +348,9 @@ Files created inside the container will appear to be owned by UID/GID 1000 in th
    paths are appended after canonicalization.
 6. `docker run --rm -i --network host --user UID:GID --workdir <cwd>` runs
    the selected command with host-shaped paths and inherited stdio. `-t` is
-   added only when stdin is an interactive terminal.
+   added only when stdin is an interactive terminal. The host Wayland socket
+   is added when the session has one, and `--voice` adds the sound-server
+   socket and/or `--device /dev/snd` (see [Audio](#audio---voice)).
 
 ## Customization
 

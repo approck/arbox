@@ -30,6 +30,13 @@ ENV DEBIAN_FRONTEND=noninteractive
 #     sqlite, postgres, zlib, lzma.
 #   - protobuf-compiler for tonic/prost.
 #   - gdb for debugging.
+#   - Audio userspace: sox (its `rec`/`play` front-ends are what claude's
+#     /voice records with) plus libsox-fmt-all for the pulse/alsa/format
+#     backends, alsa-utils + pulseaudio-utils to inspect devices
+#     (aplay -l, pactl info) when sound misbehaves, and libasound2-plugins
+#     for the ALSA -> PulseAudio bridge so ALSA-only callers still reach the
+#     host's sound server. The devices and socket themselves are NOT in the
+#     image — they come in at runtime, only under `arbox --voice`.
 #   - The rest are agent ergonomics: shells, search tools, network tools,
 #     wayland-clipboard for image paste, python + uv (later) for PEP-723
 #     scripts.
@@ -43,6 +50,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
       ripgrep fd-find bat tree tmux shellcheck \
       dnsutils iputils-ping \
       wl-clipboard \
+      sox libsox-fmt-all alsa-utils pulseaudio-utils libasound2-plugins \
       python3 python3-venv python3-pip \
       libnss3 libatk1.0-0 libatk-bridge2.0-0 libcups2 libxkbcommon0 \
       libxcomposite1 libxdamage1 libxfixes3 libxrandr2 libgbm1 \
@@ -55,6 +63,25 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # (and every agent) actually uses.
 RUN ln -s /usr/bin/fdfind /usr/local/bin/fd \
  && ln -s /usr/bin/batcat /usr/local/bin/bat
+
+# Route ALSA's "default" device through PulseAudio, so callers that only speak
+# ALSA (aplay/arecord, chromium) reach the sound-server socket `arbox --voice`
+# mounts — the common case, since that socket needs no /dev/snd passthrough at
+# all. `fallback "sysdefault"` is what makes this safe to bake in
+# unconditionally: with no socket mounted (or `--voice` passing only /dev/snd)
+# the pulse connection fails and ALSA drops straight back to the real hardware,
+# rather than the config turning a hardware-only box mute.
+RUN install -d /etc/alsa/conf.d \
+ && printf '%s\n' \
+      'pcm.!default {' \
+      '    type pulse' \
+      '    fallback "sysdefault"' \
+      '}' \
+      'ctl.!default {' \
+      '    type pulse' \
+      '    fallback "sysdefault"' \
+      '}' \
+    > /etc/alsa/conf.d/99-arbox-pulse.conf
 
 # uv (Python package + project manager). Versioned tarball direct from
 # GitHub releases — no `curl | sh` against a moving install script. Override

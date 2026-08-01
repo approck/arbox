@@ -28,6 +28,16 @@ struct Cli {
     #[arg(long = "downloads", global = true)]
     downloads: bool,
 
+    /// Bind the host's sound hardware into the container (global): the
+    /// PulseAudio/PipeWire socket and/or the ALSA devices under /dev/snd.
+    /// Off by default; fails if the host has no audio to bind. Linux only.
+    ///
+    /// For `arbox claude` this also turns Claude Code's voice mode on for the
+    /// session (via --settings), so push-to-talk works without running /voice
+    /// first and without editing your host settings.json.
+    #[arg(long = "voice", global = true)]
+    voice: bool,
+
     /// Use a named auth profile (global). Sources each agent's ENTIRE state
     /// tree (auth + history + memories + sessions + settings) from
     /// `~/.arbox/profiles/NAME/` instead of the standard host locations, so a
@@ -47,6 +57,7 @@ enum Cmd {
     ///
     /// All trailing args are forwarded to claude:
     ///   `arbox claude --resume`, `arbox claude "describe this repo"`.
+    /// With --voice, claude also starts with voice mode enabled.
     Claude {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
@@ -162,6 +173,7 @@ fn main() -> ExitCode {
         rw,
         ro: cli.ro,
         profile: cli.profile,
+        voice: cli.voice,
     };
     match dispatch(cli.cmd, opts) {
         Ok(code) => code,

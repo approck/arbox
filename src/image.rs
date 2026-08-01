@@ -291,5 +291,6 @@ pub fn print_status(profile: Option<&str>) -> Result<()> {
         println!("  status: not built — run `arbox update` (or any launch verb) to build it");
     }
     println!("network: host");
+    println!("audio:   {}", crate::launch::detect_audio(&host).summary());
     Ok(())
 }

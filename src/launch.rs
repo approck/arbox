@@ -361,13 +361,16 @@ fn ensure_agent_state(host: &HostContext, agent: &str, profile: Option<&str>) ->
 }
 
 /// Per-invocation launch options shared by every verb: the user's extra
-/// bind-mount paths and the optional `--profile` name. Bundled so adding a
-/// cross-cutting knob doesn't ripple through every verb function's signature.
+/// bind-mount paths, the optional `--profile` name, and the `--voice` opt-in.
+/// Bundled so adding a cross-cutting knob doesn't ripple through every verb
+/// function's signature.
 #[derive(Default)]
 pub struct Opts {
     pub rw: Vec<PathBuf>,
     pub ro: Vec<PathBuf>,
     pub profile: Option<String>,
+    /// Bind the host's sound hardware into the container (`--voice`).
+    pub voice: bool,
 }
 
 /// Validate a `--profile` name before it becomes part of a filename. Reject
@@ -407,10 +410,26 @@ fn run_agent(
     run(host, argv, opts)
 }
 
+/// Claude Code has no `--voice` flag: voice mode is a *setting*
+/// (`voice.enabled`), normally toggled by the `/voice` slash command, which
+/// writes it into `~/.claude/settings.json`. Since that file is bind-mounted
+/// from the host, toggling it inside the box would silently flip voice on for
+/// the host's own claude too. `--settings <json>` instead layers these values
+/// onto the effective settings for this session only, which is exactly the
+/// scope `arbox --voice` implies. Only `enabled` is set, so a user who has
+/// picked `voice.mode: "tap"` keeps whatever their own settings say.
+const CLAUDE_VOICE_SETTINGS: &str = r#"{"voice":{"enabled":true}}"#;
+
 pub fn run_claude(extra: Vec<String>, opts: Opts) -> Result<ExitCode> {
     // The container IS the sandbox, so granting claude full permissions
     // inside is the correct posture.
-    run_agent("claude", &["--dangerously-skip-permissions"], extra, opts)
+    let mut injected = vec!["--dangerously-skip-permissions"];
+    if opts.voice {
+        // Injected ahead of the user's trailing args, so an explicit
+        // `arbox claude --voice -- --settings ...` still wins.
+        injected.extend(["--settings", CLAUDE_VOICE_SETTINGS]);
+    }
+    run_agent("claude", &injected, extra, opts)
 }
 
 pub fn run_codex(extra: Vec<String>, opts: Opts) -> Result<ExitCode> {
@@ -499,6 +518,9 @@ fn ensure_all_agent_state(host: &HostContext, profile: Option<&str>) -> Result<(
 fn run(host: HostContext, argv: Vec<String>, opts: Opts) -> Result<ExitCode> {
     ensure_docker_installed()?;
     host::require_supported_distro(&host)?;
+    // Resolved before the image build so a bad `--voice` fails in a second
+    // rather than after a multi-minute bootstrap.
+    let audio = opts.voice.then(|| require_audio(&host)).transpose()?;
     let added_safe_dir = fixup_windows_worktree(&host)?;
     let mut mounts = mount_specs(&host, opts.profile.as_deref());
     append_extra_mounts(&mut mounts, &opts.rw, false)?;
@@ -562,6 +584,9 @@ fn run(host: HostContext, argv: Vec<String>, opts: Opts) -> Result<ExitCode> {
     }
 
     add_wayland_clipboard(&mut cmd);
+    if let Some(audio) = &audio {
+        audio.apply(&mut cmd);
+    }
 
     cmd.arg(&tag);
     for a in &argv {
@@ -624,6 +649,220 @@ fn add_wayland_clipboard(cmd: &mut Command) {
     cmd.arg("--mount")
         .arg(format!("type=bind,src={socket_str},dst={socket_str}"));
     cmd.arg("-e").arg(format!("WAYLAND_DISPLAY={socket_str}"));
+}
+
+/// The host sound plumbing `--voice` hands to the container. Nothing here is
+/// bound without the flag: audio is opt-in because it widens the sandbox from
+/// "files you named" to "the machine's microphone and speakers", which is a
+/// real capability to give an agent (claude's `/voice`, TTS playback,
+/// Playwright media tests) and a real thing to withhold by default.
+///
+/// Two independent paths, either or both of which may be present:
+///   - the PulseAudio/PipeWire native socket, which is how a desktop session
+///     normally exposes audio and is the route that needs no device access at
+///     all — just a unix socket the server already arbitrates;
+///   - the raw ALSA character devices under `/dev/snd`, for hosts with no
+///     sound server (headless boxes, minimal sessions) or apps that insist on
+///     talking to the hardware directly.
+pub struct AudioAccess {
+    /// Native sound-server socket on the host, bind-mounted at the same path.
+    pulse_socket: Option<PathBuf>,
+    /// PulseAudio auth cookie. Servers that don't run `auth-anonymous` reject
+    /// a cookie-less client, so carry it in read-only when the host has one.
+    pulse_cookie: Option<PathBuf>,
+    /// `Some` when the host has `/dev/snd` at all, carrying the supplementary
+    /// gids that own those nodes (`audio`, typically 29). `--user uid:gid`
+    /// drops every supplementary group the host user has, so without re-adding
+    /// these the mode-0660 root:audio device nodes are unopenable inside the
+    /// container even though `--device` exposed them. `Some(vec![])` is a real
+    /// state — nodes owned outright by root — and still gets the passthrough:
+    /// whether the devices exist and who may open them are separate questions,
+    /// and only the first one decides whether `--voice` has anything to bind.
+    alsa: Option<Vec<u32>>,
+}
+
+impl AudioAccess {
+    fn is_empty(&self) -> bool {
+        self.pulse_socket.is_none() && self.alsa.is_none()
+    }
+
+    /// Append the docker flags that carry this access into the container.
+    fn apply(&self, cmd: &mut Command) {
+        if let Some(sock) = self.pulse_socket.as_ref().and_then(|p| p.to_str()) {
+            cmd.arg("--mount")
+                .arg(format!("type=bind,src={sock},dst={sock}"));
+            // Absolute server address, so nothing inside depends on
+            // XDG_RUNTIME_DIR (which arbox deliberately does not forward).
+            cmd.arg("-e").arg(format!("PULSE_SERVER=unix:{sock}"));
+            // SoX's compiled-in default device is ALSA; without this `rec` and
+            // `play` would bypass the socket we just mounted and fail on hosts
+            // where /dev/snd isn't also passed through.
+            cmd.arg("-e").arg("AUDIODRIVER=pulseaudio");
+        }
+        if let Some(cookie) = self.pulse_cookie.as_ref().and_then(|p| p.to_str()) {
+            cmd.arg("--mount")
+                .arg(format!("type=bind,src={cookie},dst={cookie},readonly"));
+            cmd.arg("-e").arg(format!("PULSE_COOKIE={cookie}"));
+        }
+        if let Some(gids) = &self.alsa {
+            // Directory form: docker expands it to every device node beneath.
+            cmd.args(["--device", "/dev/snd"]);
+            for gid in gids {
+                cmd.arg("--group-add").arg(gid.to_string());
+            }
+        }
+    }
+
+    /// One-line description for `arbox status`.
+    pub fn summary(&self) -> String {
+        let mut parts: Vec<String> = Vec::new();
+        if let Some(s) = &self.pulse_socket {
+            parts.push(format!("sound server socket {}", s.display()));
+        }
+        if self.alsa.is_some() {
+            parts.push("ALSA devices /dev/snd".to_string());
+        }
+        if parts.is_empty() {
+            "none detected on host".to_string()
+        } else {
+            format!("{} (bound only with --voice)", parts.join(" + "))
+        }
+    }
+}
+
+/// What audio the host currently offers. Pure detection — no error when
+/// there's nothing, since `arbox status` reports the empty case too.
+pub fn detect_audio(host: &HostContext) -> AudioAccess {
+    let env = |var: &str| std::env::var_os(var);
+    let pulse_socket = pulse_socket_path(host.uid, &env).filter(|p| p.exists());
+    let pulse_cookie = pulse_socket
+        .is_some()
+        .then(|| pulse_cookie_path(&host.home, &env))
+        .flatten()
+        .filter(|p| p.exists());
+    AudioAccess {
+        pulse_socket,
+        pulse_cookie,
+        alsa: alsa_devices(),
+    }
+}
+
+/// `detect_audio`, but for the `--voice` path where finding nothing is a hard
+/// error — the user asked for sound explicitly, so silently launching a mute
+/// container would just move the failure to the first `rec` invocation.
+fn require_audio(host: &HostContext) -> Result<AudioAccess> {
+    if cfg!(target_family = "windows") {
+        bail!(
+            "--voice is Linux-only: Docker Desktop has no path for handing host \
+             sound devices to a Linux container"
+        );
+    }
+    let audio = detect_audio(host);
+    if audio.is_empty() {
+        bail!(
+            "--voice: no host audio found — expected a PulseAudio/PipeWire socket at \
+             $XDG_RUNTIME_DIR/pulse/native (or a unix: address in $PULSE_SERVER) or \
+             ALSA devices at /dev/snd. A headless host, a session without a running \
+             sound server, a container without /dev/snd passed through, or a \
+             $PULSE_SERVER naming a remote tcp: server will all look like this."
+        );
+    }
+    Ok(audio)
+}
+
+/// Where the host's sound-server socket lives. A set `$PULSE_SERVER` settles
+/// it either way — that's the host user's own override — and only when it's
+/// unset does this fall back to `pulse/native` under the runtime dir. With
+/// neither, there's no socket. `$XDG_RUNTIME_DIR` is preferred but
+/// not required — it's routinely unset in ssh sessions and cron-like contexts
+/// where `/run/user/<uid>` is nonetheless there and live.
+fn pulse_socket_path(
+    uid: u32,
+    get: &dyn Fn(&str) -> Option<std::ffi::OsString>,
+) -> Option<PathBuf> {
+    if let Some(server) = get("PULSE_SERVER") {
+        // Explicit override: honor it or bind nothing. Falling back to the
+        // runtime-dir socket here would quietly point the container at a
+        // *different* server than the host user picked. A remote `tcp:` server
+        // isn't carried in — arbox doesn't forward `PULSE_SERVER` for its own
+        // sake, so there'd be nothing inside the container to act on it, and
+        // remote playback isn't what `--voice` is for.
+        return parse_pulse_server(server.to_str()?);
+    }
+    let runtime = match get("XDG_RUNTIME_DIR").map(PathBuf::from) {
+        Some(d) if d.is_absolute() => d,
+        _ => PathBuf::from(format!("/run/user/{uid}")),
+    };
+    Some(runtime.join("pulse").join("native"))
+}
+
+/// First mountable unix socket in a PulseAudio server string. The value is a
+/// whitespace-separated *list* of addresses, each optionally prefixed with a
+/// `{machine-id}` block (that's what `pax11publish` and the X11 property put
+/// there), and a bare absolute path counts as a unix address just like the
+/// explicit `unix:` form. `None` for anything unmountable — a `tcp:` address,
+/// a relative path, an empty list.
+fn parse_pulse_server(server: &str) -> Option<PathBuf> {
+    server.split_whitespace().find_map(|entry| {
+        let addr = match entry.split_once('}') {
+            Some((prefix, rest)) if prefix.starts_with('{') => rest,
+            _ => entry,
+        };
+        let path = addr.strip_prefix("unix:").unwrap_or(addr);
+        Path::new(path).is_absolute().then(|| PathBuf::from(path))
+    })
+}
+
+/// The PulseAudio auth cookie: `$PULSE_COOKIE`, else the standard
+/// `~/.config/pulse/cookie`.
+fn pulse_cookie_path(
+    home: &Path,
+    get: &dyn Fn(&str) -> Option<std::ffi::OsString>,
+) -> Option<PathBuf> {
+    match get("PULSE_COOKIE").map(PathBuf::from) {
+        Some(p) if p.is_absolute() => Some(p),
+        Some(_) => None,
+        None => Some(home.join(".config").join("pulse").join("cookie")),
+    }
+}
+
+/// `Some(group owners of the /dev/snd nodes, deduped)`, or `None` when the
+/// host has no ALSA devices to pass through. The gids are read off the
+/// filesystem rather than assuming `audio` is gid 29 — distros and container
+/// bases disagree — and an empty vec just means root owns the nodes outright,
+/// which is still a `/dev/snd` worth passing through.
+#[cfg(target_family = "unix")]
+fn alsa_devices() -> Option<Vec<u32>> {
+    use std::os::unix::fs::MetadataExt;
+
+    let nodes: Vec<_> = std::fs::read_dir("/dev/snd")
+        .ok()?
+        .flatten()
+        .filter_map(|e| e.metadata().ok())
+        // Skip the `by-id`/`by-path` subdirectories; only the character
+        // devices themselves carry the ownership that matters.
+        .filter(|m| !m.is_dir())
+        .collect();
+    if nodes.is_empty() {
+        // The directory exists but holds no device nodes — a nested container
+        // with an empty /dev/snd. Nothing to bind, so don't claim otherwise.
+        return None;
+    }
+    let mut gids: Vec<u32> = nodes
+        .iter()
+        .map(|m| m.gid())
+        // root already owns everything the container's root-owned mounts need;
+        // adding gid 0 as a supplementary group would hand out far more.
+        .filter(|g| *g != 0)
+        .collect();
+    gids.sort_unstable();
+    gids.dedup();
+    Some(gids)
+}
+
+#[cfg(target_family = "windows")]
+fn alsa_devices() -> Option<Vec<u32>> {
+    None
 }
 
 /// Resolve and append user-specified `--rw`/`--ro` paths as required mounts.
@@ -768,6 +1007,119 @@ mod tests {
         // Relative base-dir values are invalid per the spec — ignored.
         let rel_get = |_: &str| Some(OsString::from("relative/dir"));
         assert_eq!(xdg_override(".config/opencode", &rel_get), None);
+    }
+
+    // Path::is_absolute has Windows semantics, and the whole audio path is
+    // Linux-only, so pin this on Unix.
+    #[cfg(not(target_family = "windows"))]
+    #[test]
+    fn pulse_socket_resolution() {
+        use std::ffi::OsString;
+
+        // Nothing set → the standard runtime-dir location for the uid.
+        assert_eq!(
+            pulse_socket_path(1000, &|_| None),
+            Some(PathBuf::from("/run/user/1000/pulse/native"))
+        );
+
+        // XDG_RUNTIME_DIR moves it; a relative value is ignored per the spec.
+        let xdg = |var: &str| (var == "XDG_RUNTIME_DIR").then(|| OsString::from("/run/u"));
+        assert_eq!(
+            pulse_socket_path(1000, &xdg),
+            Some(PathBuf::from("/run/u/pulse/native"))
+        );
+        let rel = |var: &str| (var == "XDG_RUNTIME_DIR").then(|| OsString::from("run/u"));
+        assert_eq!(
+            pulse_socket_path(7, &rel),
+            Some(PathBuf::from("/run/user/7/pulse/native"))
+        );
+
+        // PULSE_SERVER wins, but only in its mountable unix-socket form.
+        let unix = |var: &str| (var == "PULSE_SERVER").then(|| OsString::from("unix:/tmp/pa.sock"));
+        assert_eq!(
+            pulse_socket_path(1000, &unix),
+            Some(PathBuf::from("/tmp/pa.sock"))
+        );
+        let tcp = |var: &str| (var == "PULSE_SERVER").then(|| OsString::from("tcp:10.0.0.2:4713"));
+        assert_eq!(pulse_socket_path(1000, &tcp), None);
+    }
+
+    // PULSE_SERVER is an address *list*, and the forms below all show up in
+    // the wild — a bare path, a `{machine-id}` prefix, several entries where
+    // only one is mountable.
+    #[cfg(not(target_family = "windows"))]
+    #[test]
+    fn pulse_server_address_list_parsing() {
+        assert_eq!(
+            parse_pulse_server("unix:/tmp/pa.sock"),
+            Some(PathBuf::from("/tmp/pa.sock"))
+        );
+        assert_eq!(
+            parse_pulse_server("/run/user/1000/pulse/native"),
+            Some(PathBuf::from("/run/user/1000/pulse/native"))
+        );
+        assert_eq!(
+            parse_pulse_server("{f00dcafe}unix:/run/user/1000/pulse/native"),
+            Some(PathBuf::from("/run/user/1000/pulse/native"))
+        );
+        // First mountable entry wins; unmountable ones are skipped, not fatal.
+        assert_eq!(
+            parse_pulse_server("tcp:10.0.0.2:4713 unix:/tmp/pa.sock"),
+            Some(PathBuf::from("/tmp/pa.sock"))
+        );
+        assert_eq!(parse_pulse_server("tcp:10.0.0.2:4713"), None);
+        assert_eq!(parse_pulse_server("unix:rel/pa.sock"), None);
+        assert_eq!(parse_pulse_server(""), None);
+    }
+
+    #[cfg(not(target_family = "windows"))]
+    #[test]
+    fn pulse_cookie_resolution() {
+        use std::ffi::OsString;
+
+        let home = Path::new("/home/jason");
+        assert_eq!(
+            pulse_cookie_path(home, &|_| None),
+            Some(PathBuf::from("/home/jason/.config/pulse/cookie"))
+        );
+        let set = |var: &str| (var == "PULSE_COOKIE").then(|| OsString::from("/etc/pa-cookie"));
+        assert_eq!(
+            pulse_cookie_path(home, &set),
+            Some(PathBuf::from("/etc/pa-cookie"))
+        );
+        // A relative override is not usable as a bind source — no cookie.
+        let rel = |var: &str| (var == "PULSE_COOKIE").then(|| OsString::from("pa-cookie"));
+        assert_eq!(pulse_cookie_path(home, &rel), None);
+    }
+
+    #[test]
+    fn audio_summary_reports_empty_and_populated() {
+        let none = AudioAccess {
+            pulse_socket: None,
+            pulse_cookie: None,
+            alsa: None,
+        };
+        assert!(none.is_empty());
+        assert_eq!(none.summary(), "none detected on host");
+
+        let both = AudioAccess {
+            pulse_socket: Some(PathBuf::from("/run/user/1000/pulse/native")),
+            pulse_cookie: None,
+            alsa: Some(vec![29]),
+        };
+        assert!(!both.is_empty());
+        assert!(both.summary().contains("/run/user/1000/pulse/native"));
+        assert!(both.summary().contains("/dev/snd"));
+
+        // /dev/snd owned outright by root: no group to add, but the devices
+        // are there and `--voice` must still count and bind them.
+        let root_owned = AudioAccess {
+            pulse_socket: None,
+            pulse_cookie: None,
+            alsa: Some(Vec::new()),
+        };
+        assert!(!root_owned.is_empty());
+        assert!(root_owned.summary().contains("/dev/snd"));
     }
 
     #[test]
