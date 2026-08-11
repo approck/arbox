@@ -244,8 +244,9 @@ what `/voice` records with), `alsa-utils` and `pulseaudio-utils` for poking at
 devices, and an ALSA config that routes the default PCM through PulseAudio
 with a fallback to real hardware, so ALSA-only callers work in either mode.
 
-`--voice` is Linux-only. On Windows it errors out immediately, since Docker
-Desktop has no way to hand host sound devices to a Linux container.
+`--voice` is Linux-only. It errors out immediately on both Windows and macOS,
+since Docker Desktop has no way to hand host sound devices to a Linux
+container on either platform.
 
 ### Auth profiles (`--profile`)
 

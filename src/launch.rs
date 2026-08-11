@@ -759,6 +759,12 @@ fn require_audio(host: &HostContext) -> Result<AudioAccess> {
              sound devices to a Linux container"
         );
     }
+    if cfg!(target_os = "macos") {
+        bail!(
+            "--voice is Linux-only: macOS has no PulseAudio/ALSA, and Docker \
+             Desktop's Linux VM has no path to the host's CoreAudio devices"
+        );
+    }
     let audio = detect_audio(host);
     if audio.is_empty() {
         bail!(
