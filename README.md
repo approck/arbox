@@ -2,7 +2,7 @@
 
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
 
-# Linux and Windows. Requires Docker.
+# Linux, macOS, and Windows. Requires Docker.
 
 ## LLM Produced Code Notice
 
@@ -100,13 +100,17 @@ escape or host shell access.
 
 ## Requirements
 
-- **Ubuntu Linux or Windows** host with Docker. On Linux, the image is built
-  from your host's Ubuntu codename so libc and toolchain behavior line up with
-  the host. On Windows, the image runs `ubuntu:noble` inside Docker Desktop.
-- **Docker Engine** on `PATH`. On Windows, Docker Desktop is required.
+- **Ubuntu Linux, macOS, or Windows** host with Docker. On Linux, the image is
+  built from your host's Ubuntu codename so libc and toolchain behavior line
+  up with the host. On macOS and Windows, the image runs `ubuntu:noble`
+  inside Docker Desktop.
+- **Docker Engine** on `PATH`. On macOS and Windows, Docker Desktop is
+  required.
 - **[rustup](https://rustup.rs)** installed on the host (Linux only). `~/.cargo`
-  and `~/.rustup` must exist before launching arbox. On Windows, rustup is
-  installed inside the container automatically.
+  and `~/.rustup` must exist before launching arbox. On macOS and Windows,
+  rustup is installed inside the container automatically instead — a macOS
+  host's own rustup toolchain can't run inside the Linux container, so it
+  isn't mounted.
 - **Git** on the host. The workspace is resolved via `git rev-parse
   --show-toplevel`.
 - **For the AI agents (claude, codex, opencode, agy, grok): nothing on the
@@ -240,8 +244,8 @@ what `/voice` records with), `alsa-utils` and `pulseaudio-utils` for poking at
 devices, and an ALSA config that routes the default PCM through PulseAudio
 with a fallback to real hardware, so ALSA-only callers work in either mode.
 
-`--voice` is Linux-only; on Windows it errors out, since Docker Desktop has no
-way to hand host sound devices to a Linux container.
+`--voice` is Linux-only. On Windows it errors out immediately, since Docker
+Desktop has no way to hand host sound devices to a Linux container.
 
 ### Auth profiles (`--profile`)
 

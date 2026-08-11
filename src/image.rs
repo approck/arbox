@@ -38,15 +38,17 @@ fn dockerfile_hash() -> String {
 /// codename + uid). Used by `clean` to wipe stale images when the
 /// Dockerfile-hash changes.
 ///
-/// The platform segment (`win`/`nix`) matters because a Windows build and a
-/// Linux build can otherwise collide: the embedded Dockerfile bytes are
-/// identical (same `dockerfile_hash`) and Windows hardcodes uid 1000 + the
-/// `noble` codename, but the two builds differ (Windows bakes rustup and skips
-/// host-user creation via `WINDOWS_HOST=true`). Without this, a shared Docker
-/// Desktop/WSL2 daemon would let `ensure_built` serve the wrong-platform image.
+/// The platform segment (`win`/`mac`/`nix`) matters because builds for
+/// different host platforms can otherwise collide: the embedded Dockerfile
+/// bytes are identical (same `dockerfile_hash`), but Windows and macOS bake
+/// rustup into the image (`BAKE_RUSTUP=true`) while Linux mounts it from the
+/// host. Without this segment, a shared Docker Desktop/WSL2 daemon would let
+/// `ensure_built` serve the wrong-platform image.
 pub fn tag_prefix(host: &HostContext) -> String {
     let plat = if cfg!(target_family = "windows") {
         "win"
+    } else if cfg!(target_os = "macos") {
+        "mac"
     } else {
         "nix"
     };
@@ -139,6 +141,12 @@ fn build_with_args(host: &HostContext, t: &str, mode: BuildMode) -> Result<()> {
         .arg(format!("HOST_HOME={}", home_str));
     if cfg!(target_family = "windows") {
         cmd.args(["--build-arg", "WINDOWS_HOST=true"])
+            .args(["--build-arg", "BAKE_RUSTUP=true"])
+            .args(["--build-arg", "CARGO_HOME=/usr/local/cargo"])
+            .args(["--build-arg", "RUSTUP_HOME=/usr/local/rustup"]);
+    } else if cfg!(target_os = "macos") {
+        // macOS rustup binaries can't run in the Linux container.
+        cmd.args(["--build-arg", "BAKE_RUSTUP=true"])
             .args(["--build-arg", "CARGO_HOME=/usr/local/cargo"])
             .args(["--build-arg", "RUSTUP_HOME=/usr/local/rustup"]);
     } else {

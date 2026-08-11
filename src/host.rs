@@ -1,7 +1,9 @@
 use anyhow::{anyhow, bail, Context, Result};
 use std::path::{Path, PathBuf};
 
-use crate::{git, osrelease, passwd};
+use crate::{git, passwd};
+#[cfg(target_os = "linux")]
+use crate::osrelease;
 
 /// Everything we need to know about the host to mirror it in the container.
 /// Detected fresh on every invocation. Base facts (uid/gid/distro/etc.) are
@@ -127,7 +129,7 @@ fn get_gid() -> u32 {
     1000
 }
 
-#[cfg(target_family = "unix")]
+#[cfg(target_os = "linux")]
 fn get_distro() -> Result<(String, String)> {
     let osrel = osrelease::parse("/etc/os-release").context("reading /etc/os-release")?;
     let id = osrel
@@ -142,6 +144,12 @@ fn get_distro() -> Result<(String, String)> {
 }
 
 #[cfg(target_family = "windows")]
+fn get_distro() -> Result<(String, String)> {
+    Ok(("ubuntu".to_string(), "noble".to_string()))
+}
+
+// macOS has no host distro; the container is always Ubuntu, as on Windows.
+#[cfg(target_os = "macos")]
 fn get_distro() -> Result<(String, String)> {
     Ok(("ubuntu".to_string(), "noble".to_string()))
 }

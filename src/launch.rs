@@ -215,7 +215,9 @@ pub fn mount_specs(host: &HostContext, profile: Option<&str>) -> Vec<MountSpec> 
         }
     }
 
-    if !cfg!(target_family = "windows") {
+    // Mounted from the host only on Linux; Windows and macOS bake their own
+    // rustup into the image instead (see image::build_with_args).
+    if cfg!(target_os = "linux") {
         specs.extend([
             MountSpec::new(
                 h.join(".cargo"),
@@ -972,11 +974,11 @@ mod tests {
         }
 
         // Non-agent mounts stay shared even under a profile. ~/.gitconfig is
-        // mounted on every platform; ~/.cargo and ~/.rustup only on non-Windows
-        // hosts (Windows bakes the toolchain into the image instead), so guard
-        // those so the test doesn't panic on a Windows build.
+        // mounted on every platform; ~/.cargo and ~/.rustup only on Linux
+        // hosts (Windows and macOS bake the toolchain into the image
+        // instead), so guard those so the test doesn't panic elsewhere.
         let mut shared = vec!["/home/jason/.gitconfig"];
-        if !cfg!(target_family = "windows") {
+        if cfg!(target_os = "linux") {
             shared.extend(["/home/jason/.cargo", "/home/jason/.rustup"]);
         }
         for d in shared {

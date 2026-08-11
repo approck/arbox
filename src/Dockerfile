@@ -143,18 +143,17 @@ RUN npm install -g \
  && playwright install chromium firefox \
  && chmod -R a+rX /opt/ms-playwright
 
-# Rust toolchain: conditionally baked into the image for Windows hosts, or
-# mounted from the host for native Linux/Unix hosts. On Windows, install
-# rustup inside the container; on Linux, host ~/.cargo/.rustup are mounted at
-# runtime and this RUN is a cheap no-op. Lives ABOVE the agent cache-bust
-# barrier because the toolchain download is expensive and must stay cached
-# across `arbox update` runs.
+# Rust toolchain: baked into the image for Windows/macOS hosts (BAKE_RUSTUP),
+# or mounted from the host for native Linux hosts, where this RUN is a cheap
+# no-op. Lives ABOVE the agent cache-bust barrier because the toolchain
+# download is expensive and must stay cached across `arbox update` runs.
 ARG WINDOWS_HOST=false
+ARG BAKE_RUSTUP=false
 ARG CARGO_HOME=/root/.cargo
 ARG RUSTUP_HOME=/root/.rustup
 ENV CARGO_HOME=${CARGO_HOME}
 ENV RUSTUP_HOME=${RUSTUP_HOME}
-RUN if [ "${WINDOWS_HOST}" = "true" ]; then \
+RUN if [ "${BAKE_RUSTUP}" = "true" ]; then \
       curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable && \
       chmod -R 777 /usr/local/cargo /usr/local/rustup; \
     fi
