@@ -176,10 +176,9 @@ fn state_source(home: &Path, rel: &str, xdg: bool, profile: Option<&str>) -> Pat
 fn xdg_override(rel: &str, get: &dyn Fn(&str) -> Option<std::ffi::OsString>) -> Option<PathBuf> {
     let (var, suffix) = if let Some(s) = rel.strip_prefix(".config/") {
         ("XDG_CONFIG_HOME", s)
-    } else if let Some(s) = rel.strip_prefix(".local/share/") {
-        ("XDG_DATA_HOME", s)
     } else {
-        return None;
+        let s = rel.strip_prefix(".local/share/")?;
+        ("XDG_DATA_HOME", s)
     };
     let base = PathBuf::from(get(var)?);
     base.is_absolute().then(|| base.join(suffix))
@@ -215,9 +214,9 @@ pub fn mount_specs(host: &HostContext, profile: Option<&str>) -> Vec<MountSpec> 
         }
     }
 
-    // Mounted from the host only on Linux; Windows and macOS bake their own
-    // rustup into the image instead (see image::build_with_args).
-    if cfg!(target_os = "linux") {
+    // Mounted from the host only where the image doesn't bake its own rustup
+    // (see host::bakes_rustup / image::build_with_args).
+    if !host::bakes_rustup() {
         specs.extend([
             MountSpec::new(
                 h.join(".cargo"),
@@ -450,9 +449,10 @@ pub fn run_opencode(extra: Vec<String>, opts: Opts) -> Result<ExitCode> {
     // (~/.local/share/opencode/auth.json), no keyring needed, so `opencode
     // auth login` inside the box persists via the state mount. Local
     // providers on the host (e.g. Ollama on localhost:11434) are reachable
-    // on Linux, where --network host is the real host network; on Windows,
-    // Docker Desktop only honors --network host with its opt-in
-    // host-networking feature enabled.
+    // on Linux, where --network host is the real host network; on Windows
+    // and macOS, Docker Desktop only honors --network host with its opt-in
+    // host-networking feature enabled — off by default, so localhost inside
+    // the container resolves to the Docker Desktop VM instead of the host.
     run_agent("opencode", &[], extra, opts)
 }
 
@@ -734,7 +734,20 @@ impl AudioAccess {
 
 /// What audio the host currently offers. Pure detection — no error when
 /// there's nothing, since `arbox status` reports the empty case too.
+///
+/// Linux-only by construction: on Windows and macOS, Docker Desktop's Linux
+/// VM has no path to the host's sound devices at all, so detection always
+/// reports empty there rather than reporting a socket/device `--voice` then
+/// can't actually use (`require_audio` and `arbox status` must agree on
+/// this, or status can promise audio `--voice` refuses).
 pub fn detect_audio(host: &HostContext) -> AudioAccess {
+    if !cfg!(target_os = "linux") {
+        return AudioAccess {
+            pulse_socket: None,
+            pulse_cookie: None,
+            alsa: None,
+        };
+    }
     let env = |var: &str| std::env::var_os(var);
     let pulse_socket = pulse_socket_path(host.uid, &env).filter(|p| p.exists());
     let pulse_cookie = pulse_socket
@@ -753,26 +766,20 @@ pub fn detect_audio(host: &HostContext) -> AudioAccess {
 /// error — the user asked for sound explicitly, so silently launching a mute
 /// container would just move the failure to the first `rec` invocation.
 fn require_audio(host: &HostContext) -> Result<AudioAccess> {
-    if cfg!(target_family = "windows") {
-        bail!(
-            "--voice is Linux-only: Docker Desktop has no path for handing host \
-             sound devices to a Linux container"
-        );
-    }
-    if cfg!(target_os = "macos") {
-        bail!(
-            "--voice is Linux-only: macOS has no PulseAudio/ALSA, and Docker \
-             Desktop's Linux VM has no path to the host's CoreAudio devices"
-        );
-    }
     let audio = detect_audio(host);
     if audio.is_empty() {
+        if cfg!(target_os = "linux") {
+            bail!(
+                "--voice: no host audio found — expected a PulseAudio/PipeWire socket at \
+                 $XDG_RUNTIME_DIR/pulse/native (or a unix: address in $PULSE_SERVER) or \
+                 ALSA devices at /dev/snd. A headless host, a session without a running \
+                 sound server, a container without /dev/snd passed through, or a \
+                 $PULSE_SERVER naming a remote tcp: server will all look like this."
+            );
+        }
         bail!(
-            "--voice: no host audio found — expected a PulseAudio/PipeWire socket at \
-             $XDG_RUNTIME_DIR/pulse/native (or a unix: address in $PULSE_SERVER) or \
-             ALSA devices at /dev/snd. A headless host, a session without a running \
-             sound server, a container without /dev/snd passed through, or a \
-             $PULSE_SERVER naming a remote tcp: server will all look like this."
+            "--voice is Linux-only: Docker Desktop's Linux VM has no path to the host's \
+             sound devices on Windows or macOS"
         );
     }
     Ok(audio)
@@ -980,11 +987,11 @@ mod tests {
         }
 
         // Non-agent mounts stay shared even under a profile. ~/.gitconfig is
-        // mounted on every platform; ~/.cargo and ~/.rustup only on Linux
-        // hosts (Windows and macOS bake the toolchain into the image
-        // instead), so guard those so the test doesn't panic elsewhere.
+        // mounted on every platform; ~/.cargo and ~/.rustup only where the
+        // image doesn't bake its own rustup, so guard those so the test
+        // doesn't panic elsewhere.
         let mut shared = vec!["/home/jason/.gitconfig"];
-        if cfg!(target_os = "linux") {
+        if !host::bakes_rustup() {
             shared.extend(["/home/jason/.cargo", "/home/jason/.rustup"]);
         }
         for d in shared {

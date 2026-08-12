@@ -15,8 +15,8 @@ enum BuildMode {
     /// Cached build, but pass a fresh `AGENT_REFRESH` token so the five agent
     /// layers (plus the cheap user-setup steps below them) re-run and pull
     /// their latest versions. Every expensive layer above the cache-bust
-    /// barrier — apt, node, Playwright, the Windows rustup toolchain — stays
-    /// cached.
+    /// barrier — apt, node, Playwright, the baked rustup toolchain on
+    /// Windows/macOS — stays cached.
     RefreshAgents,
     /// `--no-cache`: re-run every layer from scratch (apt, node, the
     /// Playwright browser downloads, everything).
@@ -140,12 +140,9 @@ fn build_with_args(host: &HostContext, t: &str, mode: BuildMode) -> Result<()> {
         .arg("--build-arg")
         .arg(format!("HOST_HOME={}", home_str));
     if cfg!(target_family = "windows") {
-        cmd.args(["--build-arg", "WINDOWS_HOST=true"])
-            .args(["--build-arg", "BAKE_RUSTUP=true"])
-            .args(["--build-arg", "CARGO_HOME=/usr/local/cargo"])
-            .args(["--build-arg", "RUSTUP_HOME=/usr/local/rustup"]);
-    } else if cfg!(target_os = "macos") {
-        // macOS rustup binaries can't run in the Linux container.
+        cmd.args(["--build-arg", "WINDOWS_HOST=true"]);
+    }
+    if host::bakes_rustup() {
         cmd.args(["--build-arg", "BAKE_RUSTUP=true"])
             .args(["--build-arg", "CARGO_HOME=/usr/local/cargo"])
             .args(["--build-arg", "RUSTUP_HOME=/usr/local/rustup"]);

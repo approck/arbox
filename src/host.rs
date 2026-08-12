@@ -143,13 +143,22 @@ fn get_distro() -> Result<(String, String)> {
     Ok((id, codename))
 }
 
-#[cfg(target_family = "windows")]
+// Windows and macOS have no host distro to mirror; the container is always
+// the same baked Ubuntu image (see bakes_rustup / image::build_with_args).
+// Falls back to this arm for every non-Linux target rather than enumerating
+// Windows/macOS individually, so an unanticipated target still compiles and
+// fails at the `require_supported_distro` runtime gate instead of losing
+// `get_distro` entirely at compile time.
+#[cfg(not(target_os = "linux"))]
 fn get_distro() -> Result<(String, String)> {
     Ok(("ubuntu".to_string(), "noble".to_string()))
 }
 
-// macOS has no host distro; the container is always Ubuntu, as on Windows.
-#[cfg(target_os = "macos")]
-fn get_distro() -> Result<(String, String)> {
-    Ok(("ubuntu".to_string(), "noble".to_string()))
+/// Whether the container bakes its own rustup instead of mounting the host's
+/// `~/.cargo`/`~/.rustup`. True on Windows and macOS: Windows has no host
+/// rustup to mount, and a macOS rustup's Mach-O binaries can't run in the
+/// Linux container. Single source of truth for `image::build_with_args` and
+/// `launch::mount_specs`, which must otherwise agree with each other by hand.
+pub fn bakes_rustup() -> bool {
+    cfg!(not(target_os = "linux"))
 }

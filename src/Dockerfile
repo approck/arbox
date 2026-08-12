@@ -155,7 +155,7 @@ ENV CARGO_HOME=${CARGO_HOME}
 ENV RUSTUP_HOME=${RUSTUP_HOME}
 RUN if [ "${BAKE_RUSTUP}" = "true" ]; then \
       curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable && \
-      chmod -R 777 /usr/local/cargo /usr/local/rustup; \
+      chmod -R 777 "${CARGO_HOME}" "${RUSTUP_HOME}"; \
     fi
 
 # Cache-bust barrier for the five agent layers below. `arbox update` passes a
@@ -163,8 +163,8 @@ RUN if [ "${BAKE_RUSTUP}" = "true" ]; then \
 # layer and therefore every layer after it — the claude/codex/opencode/agy/grok
 # installs re-run and pull their latest published versions, while every
 # expensive layer ABOVE this point (apt, uv, deno, node, the ~700 MB
-# Playwright browser downloads, the Windows-host rustup toolchain) stays
-# cached. The default 0 keeps ordinary cached builds (the auto-bootstrap on
+# Playwright browser downloads, the baked rustup toolchain on Windows/macOS)
+# stays cached. The default 0 keeps ordinary cached builds (the auto-bootstrap on
 # first launch, `arbox update --force`'s --no-cache pass) unaffected: the
 # agents only move when you run `arbox update`. This barrier MUST stay below
 # the last expensive layer and above the first agent install.
@@ -223,13 +223,29 @@ RUN mkdir -p /tmp/grok-stage \
 
 # Mirror the host user/group exactly.
 # Most ubuntu:<codename> base images ship a default user at uid 1000;
-# rename that entry instead of failing on conflict.
+# rename that entry instead of failing on conflict. Renaming by GID/UID also
+# covers macOS hosts, whose default uid/gid (501/20) collide with the base
+# image's own `ubuntu` user and `dialout` group. Two collisions to handle,
+# not one: the entry AT the host's gid/uid may need renaming to HOST_USER,
+# AND some unrelated entry may already own the name HOST_USER wants (e.g. a
+# host user literally named "staff" colliding with the base image's own
+# `staff` group at a different gid) — group/usermod -n|-l would abort the
+# build with "already exists" in that case, so rename any such entry out of
+# the way first.
 # Skipped for windows (no matching host user exists to mirror).
 RUN if [ "${WINDOWS_HOST}" = "false" ]; then \
+      if getent group ${HOST_USER} >/dev/null \
+         && [ "$(getent group ${HOST_USER} | cut -d: -f3)" != "${HOST_GID}" ]; then \
+          groupmod -n ${HOST_USER}-arbox-old ${HOST_USER}; \
+      fi && \
       if getent group ${HOST_GID} >/dev/null; then \
           groupmod -n ${HOST_USER} $(getent group ${HOST_GID} | cut -d: -f1); \
       else \
           groupadd -g ${HOST_GID} ${HOST_USER}; \
+      fi && \
+      if getent passwd ${HOST_USER} >/dev/null \
+         && [ "$(getent passwd ${HOST_USER} | cut -d: -f3)" != "${HOST_UID}" ]; then \
+          usermod -l ${HOST_USER}-arbox-old ${HOST_USER}; \
       fi && \
       if getent passwd ${HOST_UID} >/dev/null; then \
           usermod -l ${HOST_USER} -d ${HOST_HOME} -m -g ${HOST_GID} \
@@ -263,7 +279,8 @@ RUN install -d -o ${HOST_UID} -g ${HOST_GID} \
       ${HOST_HOME}/.local/share \
       ${HOST_HOME}/.local/state
 
-# Set up PATH: include both container-installed (Windows) and host-mounted (Linux) paths.
+# Set up PATH: include both container-installed (Windows/macOS) and
+# host-mounted (Linux) paths.
 # Ordering matters: /usr/local/bin (where the baked-in claude/codex/opencode/
 # agy/grok/playwright/node/uv/deno live) MUST come before ${HOST_HOME}/.local/bin,
 # which is bind-mounted read-only from the host at runtime. If ~/.local/bin
@@ -271,8 +288,8 @@ RUN install -d -o ${HOST_UID} -g ${HOST_GID} \
 # ~/.local/bin/claude -> ~/.local/share/claude/versions/X would shadow the
 # freshly-baked binary, making `arbox update` look like a no-op. ~/.cargo/bin
 # stays first so the host's rustup shims win (no agent collides with those).
-# Windows: /usr/local/cargo/bin is used (set via CARGO_HOME above).
-# Linux: host's ${HOST_HOME}/.cargo/bin is mounted and used.
+# Windows/macOS: /usr/local/cargo/bin is used (set via CARGO_HOME above, see
+# BAKE_RUSTUP). Linux: host's ${HOST_HOME}/.cargo/bin is mounted and used.
 ENV PATH=/usr/local/cargo/bin:/root/.cargo/bin:${HOST_HOME}/.cargo/bin:/usr/local/bin:${HOST_HOME}/.local/bin:/usr/bin:/bin
 
 # Marker so the host-side `arbox` binary refuses to run inside its own

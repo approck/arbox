@@ -85,7 +85,12 @@ or a process that you intentionally gave access to your mounted credentials.
   by you on the host.
 - **The container uses host networking** (`--network host`) because coding
   agents and package managers often need normal network behavior. Do not
-  treat the network as isolated.
+  treat the network as isolated. This is passed unconditionally on every
+  platform, but only does what it says on Linux: on Windows and macOS,
+  Docker Desktop's host-networking mode is off by default, so `--network
+  host` is silently a no-op there and `localhost` inside the container
+  resolves to the Docker Desktop VM, not your machine — see the `opencode`
+  row above for the concrete symptom.
 - **`/dev/shm` is bumped to 1 GB.** Docker's 64 MB default crashes Chromium
   on non-trivial pages; the bump removes the need for
   `--disable-dev-shm-usage` on every Playwright launch.
@@ -110,7 +115,11 @@ escape or host shell access.
   and `~/.rustup` must exist before launching arbox. On macOS and Windows,
   rustup is installed inside the container automatically instead — a macOS
   host's own rustup toolchain can't run inside the Linux container, so it
-  isn't mounted.
+  isn't mounted. This also means the cargo registry/build cache is baked
+  into the image rather than shared with the host: on Linux it persists in
+  `~/.cargo` across every `arbox` invocation, but on macOS and Windows each
+  `docker run --rm` container starts from the same baked image state, so
+  `cargo build`'s downloads are re-fetched every session.
 - **Git** on the host. The workspace is resolved via `git rev-parse
   --show-toplevel`.
 - **For the AI agents (claude, codex, opencode, agy, grok): nothing on the
@@ -169,7 +178,7 @@ clear message.
 |---------------------------------|-------------|
 | `arbox claude [FLAGS] -- ARGS...` | Run Claude Code with `--dangerously-skip-permissions`. Binary baked into image; `~/.claude` + `~/.claude.json` mount from the host if present. With `--voice`, starts with voice mode already enabled. |
 | `arbox codex  [FLAGS] -- ARGS...` | Run Codex CLI with `--dangerously-bypass-approvals-and-sandbox`. Binary baked into image; `~/.codex` mounts from the host if present. |
-| `arbox opencode [FLAGS] -- ARGS...` | Run the OpenCode TUI. Binary baked into image; `~/.config/opencode` (config) and `~/.local/share/opencode` (auth in `auth.json`, sessions) mount from the host. Host-local providers like Ollama on `localhost:11434` work via host networking on Linux; on Windows, Docker Desktop reaches them only with its opt-in host-networking feature enabled. |
+| `arbox opencode [FLAGS] -- ARGS...` | Run the OpenCode TUI. Binary baked into image; `~/.config/opencode` (config) and `~/.local/share/opencode` (auth in `auth.json`, sessions) mount from the host. Host-local providers like Ollama on `localhost:11434` work via host networking on Linux; on Windows and macOS, Docker Desktop reaches them only with its opt-in host-networking feature enabled. |
 | `arbox agy    [FLAGS] -- ARGS...` | Run Google Antigravity's `agy` CLI. Binary baked into image; `~/.gemini` and `~/.config/antigravity` mount from the host. First-time auth uses agy's SSH-style URL+code flow since libsecret isn't reachable inside the container. |
 | `arbox grok   [FLAGS] -- ARGS...` | Run xAI's Grok Build CLI. Binary baked into image; `~/.grok` mounts from the host (token lives in `~/.grok/auth.json`). |
 | `arbox bash   [FLAGS]`          | Open an interactive login bash inside the container. |
