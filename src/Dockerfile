@@ -29,6 +29,7 @@ ENV DEBIAN_FRONTEND=noninteractive
 #   - System libraries most non-trivial Rust crates link against: openssl,
 #     sqlite, postgres, zlib, lzma.
 #   - protobuf-compiler for tonic/prost.
+#   - Database CLI clients: psql, redis-cli, mysql.
 #   - gdb for debugging.
 #   - Audio userspace: sox (its `rec`/`play` front-ends are what claude's
 #     /voice records with) plus libsox-fmt-all for the pulse/alsa/format
@@ -44,6 +45,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
       build-essential pkg-config clang libclang-dev cmake mold \
       libssl-dev libsqlite3-dev libpq-dev zlib1g-dev liblzma-dev \
       protobuf-compiler \
+      postgresql-client redis-tools default-mysql-client \
       gdb \
       ca-certificates curl git git-lfs \
       vim nano less sudo jq unzip zip xz-utils \
