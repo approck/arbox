@@ -38,6 +38,20 @@ struct Cli {
     #[arg(long = "voice", global = true)]
     voice: bool,
 
+    /// Bind the host's USB serial devices into the container (global):
+    /// every /dev/ttyUSB* and /dev/ttyACM* node, with the owning group
+    /// re-added so they're openable. For flashing and monitoring dev boards
+    /// (ESP32 etc.) with espflash/esptool from inside the sandbox. Off by
+    /// default; fails if the host has no such device. Linux only.
+    #[arg(long = "serial", global = true)]
+    serial: bool,
+
+    /// Bind one specific serial device instead of every USB serial node
+    /// (repeatable, global; implies --serial). Accepts the real node or a
+    /// /dev/serial/by-id/... symlink.
+    #[arg(long = "serial-dev", value_name = "DEV", global = true)]
+    serial_dev: Vec<PathBuf>,
+
     /// Use a named auth profile (global). Sources each agent's ENTIRE state
     /// tree (auth + history + memories + sessions + settings) from
     /// `~/.arbox/profiles/NAME/` instead of the standard host locations, so a
@@ -169,11 +183,21 @@ fn main() -> ExitCode {
             rw.push(home.join("Downloads"));
         }
     }
+    // An explicit device list is a narrower request than the bare flag, so it
+    // wins when both are given.
+    let serial = if !cli.serial_dev.is_empty() {
+        Some(launch::SerialRequest::Devices(cli.serial_dev))
+    } else if cli.serial {
+        Some(launch::SerialRequest::Auto)
+    } else {
+        None
+    };
     let opts = launch::Opts {
         rw,
         ro: cli.ro,
         profile: cli.profile,
         voice: cli.voice,
+        serial,
     };
     match dispatch(cli.cmd, opts) {
         Ok(code) => code,

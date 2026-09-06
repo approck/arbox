@@ -362,7 +362,8 @@ fn ensure_agent_state(host: &HostContext, agent: &str, profile: Option<&str>) ->
 }
 
 /// Per-invocation launch options shared by every verb: the user's extra
-/// bind-mount paths, the optional `--profile` name, and the `--voice` opt-in.
+/// bind-mount paths, the optional `--profile` name, and the `--voice` /
+/// `--serial` opt-ins.
 /// Bundled so adding a cross-cutting knob doesn't ripple through every verb
 /// function's signature.
 #[derive(Default)]
@@ -372,6 +373,19 @@ pub struct Opts {
     pub profile: Option<String>,
     /// Bind the host's sound hardware into the container (`--voice`).
     pub voice: bool,
+    /// Bind USB serial devices into the container (`--serial` /
+    /// `--serial-dev`). `None` binds nothing.
+    pub serial: Option<SerialRequest>,
+}
+
+/// Which USB serial devices `--serial` should bind. Auto-detection binds
+/// every `/dev/ttyUSB*` and `/dev/ttyACM*` node on the host; the explicit
+/// form binds only the named nodes (and accepts `/dev/serial/by-id/...`
+/// symlinks, which resolve to the real node).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SerialRequest {
+    Auto,
+    Devices(Vec<PathBuf>),
 }
 
 /// Validate a `--profile` name before it becomes part of a filename. Reject
@@ -523,6 +537,11 @@ fn run(host: HostContext, argv: Vec<String>, opts: Opts) -> Result<ExitCode> {
     // Resolved before the image build so a bad `--voice` fails in a second
     // rather than after a multi-minute bootstrap.
     let audio = opts.voice.then(|| require_audio(&host)).transpose()?;
+    let serial = opts.serial.as_ref().map(require_serial).transpose()?;
+    if let Some(serial) = &serial {
+        // stderr, so `arbox run -- foo | bar` pipelines stay clean.
+        eprintln!("arbox: {}", serial.launch_note());
+    }
     let added_safe_dir = fixup_windows_worktree(&host)?;
     let mut mounts = mount_specs(&host, opts.profile.as_deref());
     append_extra_mounts(&mut mounts, &opts.rw, false)?;
@@ -588,6 +607,9 @@ fn run(host: HostContext, argv: Vec<String>, opts: Opts) -> Result<ExitCode> {
     add_wayland_clipboard(&mut cmd);
     if let Some(audio) = &audio {
         audio.apply(&mut cmd);
+    }
+    if let Some(serial) = &serial {
+        serial.apply(&mut cmd);
     }
 
     cmd.arg(&tag);
@@ -880,6 +902,238 @@ fn alsa_devices() -> Option<Vec<u32>> {
     None
 }
 
+/// The USB serial plumbing `--serial` hands to the container, for flashing
+/// and monitoring microcontroller dev boards (ESP32 and friends) from inside
+/// the sandbox. Nothing here is bound without the flag: a serial port is a
+/// live link to whatever hardware is plugged in, which is a real capability
+/// to give an agent and a real thing to withhold by default.
+///
+/// Docker's `--device` alone isn't enough, for the same reason as `/dev/snd`:
+/// `--user uid:gid` drops the host user's supplementary groups, so the
+/// mode-0660 `root:dialout` nodes are unopenable inside the container until
+/// the owning gid is re-added with `--group-add`.
+pub struct SerialAccess {
+    /// Resolved character-device nodes on the host, bound at the same path.
+    devices: Vec<PathBuf>,
+    /// Supplementary gids owning those nodes (`dialout`, typically 20),
+    /// deduped, root excluded.
+    gids: Vec<u32>,
+    /// Character-device majors of the bound nodes (188 for `ttyUSB`, 166 for
+    /// `ttyACM`), deduped. Each becomes a wildcard `--device-cgroup-rule`, so
+    /// a board that re-enumerates mid-flash (the ESP32-S3/C3 USB-Serial-JTAG
+    /// drops off the bus when it enters download mode) stays reachable: if it
+    /// comes back under the same name the existing node keeps working, and if
+    /// it comes back under a new minor the user can `sudo mknod` it inside the
+    /// container without relaunching.
+    majors: Vec<u32>,
+    /// The host udev database (`/run/udev`), bind-mounted read-only when
+    /// present so libudev-based port enumeration (espflash, serialport-rs)
+    /// can read USB vendor/product ids and identify boards by name. Without
+    /// it those tools still work, but only with an explicit `--port`.
+    udev: Option<PathBuf>,
+}
+
+impl SerialAccess {
+    fn none() -> Self {
+        Self {
+            devices: Vec::new(),
+            gids: Vec::new(),
+            majors: Vec::new(),
+            udev: None,
+        }
+    }
+
+    /// Build the access set for already-validated device nodes, reading the
+    /// owning gids and device majors off the filesystem rather than assuming
+    /// `dialout` is gid 20 or that every board is a `ttyUSB` — distros and
+    /// drivers disagree.
+    fn for_devices(devices: Vec<PathBuf>) -> Self {
+        if devices.is_empty() {
+            return Self::none();
+        }
+        let mut gids = Vec::new();
+        let mut majors = Vec::new();
+        for dev in &devices {
+            if let Some((gid, major)) = device_owner_and_major(dev) {
+                // root already owns everything the container's root-owned
+                // mounts need; adding gid 0 as a supplementary group would
+                // hand out far more.
+                if gid != 0 {
+                    gids.push(gid);
+                }
+                majors.push(major);
+            }
+        }
+        gids.sort_unstable();
+        gids.dedup();
+        majors.sort_unstable();
+        majors.dedup();
+        let udev = Some(PathBuf::from("/run/udev")).filter(|p| p.is_dir());
+        Self {
+            devices,
+            gids,
+            majors,
+            udev,
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.devices.is_empty()
+    }
+
+    /// Append the docker flags that carry this access into the container.
+    fn apply(&self, cmd: &mut Command) {
+        for dev in &self.devices {
+            cmd.arg("--device").arg(dev);
+        }
+        for gid in &self.gids {
+            cmd.arg("--group-add").arg(gid.to_string());
+        }
+        for major in &self.majors {
+            cmd.arg("--device-cgroup-rule")
+                .arg(format!("c {major}:* rmw"));
+        }
+        if let Some(udev) = self.udev.as_ref().and_then(|p| p.to_str()) {
+            cmd.arg("--mount")
+                .arg(format!("type=bind,src={udev},dst={udev},readonly"));
+        }
+    }
+
+    fn device_list(&self) -> String {
+        let list: Vec<String> = self
+            .devices
+            .iter()
+            .map(|d| d.display().to_string())
+            .collect();
+        list.join(" ")
+    }
+
+    /// One-line description for `arbox status`.
+    pub fn summary(&self) -> String {
+        if self.devices.is_empty() {
+            return "none detected on host".to_string();
+        }
+        format!("{} (bound only with --serial)", self.device_list())
+    }
+
+    /// What a launch under `--serial` is actually handing over, printed once
+    /// at startup: auto-detection can pick up more than the board the user
+    /// had in mind, and a re-enumerated node name is the first thing to check
+    /// when a flash fails.
+    fn launch_note(&self) -> String {
+        let udev = match &self.udev {
+            Some(p) => format!(", udev db {} read-only", p.display()),
+            None => String::new(),
+        };
+        format!("serial devices bound: {}{udev}", self.device_list())
+    }
+}
+
+/// Is `name` a USB serial device node? Matches the two Linux drivers dev
+/// boards show up under: `ttyUSB<n>` (usb-serial bridges — CP210x, CH340,
+/// FTDI) and `ttyACM<n>` (CDC-ACM, which is what a native USB-Serial-JTAG
+/// peripheral or an Arduino-style board presents). Not `ttyS<n>` — those are
+/// the legacy UARTs every machine has whether or not anything is plugged in,
+/// and binding them would make `--serial` succeed on a host with no board.
+fn is_usb_serial_name(name: &str) -> bool {
+    ["ttyUSB", "ttyACM"].iter().any(|prefix| {
+        name.strip_prefix(prefix)
+            .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+    })
+}
+
+/// What USB serial devices the host currently offers. Pure detection — no
+/// error when there's nothing, since `arbox status` reports the empty case.
+///
+/// Linux-only by construction, like `detect_audio`: Docker Desktop's Linux VM
+/// on Windows and macOS has no USB passthrough, so detection reports empty
+/// there rather than promising devices `--serial` then can't bind.
+pub fn detect_serial() -> SerialAccess {
+    if !cfg!(target_os = "linux") {
+        return SerialAccess::none();
+    }
+    let mut devices: Vec<PathBuf> = std::fs::read_dir("/dev")
+        .ok()
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter(|e| e.file_name().to_str().is_some_and(is_usb_serial_name))
+        .map(|e| e.path())
+        .filter(|p| is_char_device(p))
+        .collect();
+    devices.sort();
+    SerialAccess::for_devices(devices)
+}
+
+/// `detect_serial` for the `--serial` path, where finding nothing is a hard
+/// error — the user asked for a board explicitly, so launching without one
+/// would just move the failure to the first `espflash` invocation. With
+/// `--serial-dev`, every named path must resolve to a character device.
+fn require_serial(request: &SerialRequest) -> Result<SerialAccess> {
+    if !cfg!(target_os = "linux") {
+        bail!(
+            "--serial is Linux-only: Docker Desktop's Linux VM has no USB passthrough on \
+             Windows or macOS"
+        );
+    }
+    let serial = match request {
+        SerialRequest::Auto => detect_serial(),
+        SerialRequest::Devices(paths) => {
+            let mut devices = Vec::with_capacity(paths.len());
+            for p in paths {
+                // Canonicalize so `/dev/serial/by-id/usb-...` symlinks turn
+                // into the real node docker's `--device` needs.
+                let abs = p
+                    .canonicalize()
+                    .with_context(|| format!("--serial-dev {}: cannot resolve", p.display()))?;
+                if !is_char_device(&abs) {
+                    bail!(
+                        "--serial-dev {}: not a character device (resolved to {})",
+                        p.display(),
+                        abs.display()
+                    );
+                }
+                if !devices.contains(&abs) {
+                    devices.push(abs);
+                }
+            }
+            SerialAccess::for_devices(devices)
+        }
+    };
+    if serial.is_empty() {
+        bail!(
+            "--serial: no USB serial devices found — expected /dev/ttyUSB* (CP210x/CH340/FTDI \
+             bridges) or /dev/ttyACM* (native USB-Serial-JTAG on ESP32-S3/C3/C6/H2). Plug the \
+             board in, or name a device explicitly with --serial-dev PATH."
+        );
+    }
+    Ok(serial)
+}
+
+#[cfg(target_family = "unix")]
+fn is_char_device(path: &Path) -> bool {
+    use std::os::unix::fs::FileTypeExt;
+    std::fs::metadata(path).is_ok_and(|m| m.file_type().is_char_device())
+}
+
+#[cfg(target_family = "windows")]
+fn is_char_device(_path: &Path) -> bool {
+    false
+}
+
+/// `(owning gid, device major)` of a character-device node.
+#[cfg(target_os = "linux")]
+fn device_owner_and_major(path: &Path) -> Option<(u32, u32)> {
+    use std::os::unix::fs::MetadataExt;
+    let m = std::fs::metadata(path).ok()?;
+    Some((m.gid(), libc::major(m.rdev())))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn device_owner_and_major(_path: &Path) -> Option<(u32, u32)> {
+    None
+}
+
 /// Resolve and append user-specified `--rw`/`--ro` paths as required mounts.
 /// Each path is canonicalized (so symlinks and relative paths resolve to a
 /// real absolute location) and mounted at the same path on both sides.
@@ -1135,6 +1389,156 @@ mod tests {
         };
         assert!(!root_owned.is_empty());
         assert!(root_owned.summary().contains("/dev/snd"));
+    }
+
+    #[test]
+    fn usb_serial_name_matching() {
+        for yes in ["ttyUSB0", "ttyUSB12", "ttyACM0", "ttyACM3"] {
+            assert!(is_usb_serial_name(yes), "{yes} should match");
+        }
+        // Legacy UARTs, bare prefixes, and lookalikes must not.
+        for no in [
+            "ttyS0", "ttyUSB", "ttyACM", "ttyUSB0a", "ttyAMA0", "tty0", "usbmon0",
+        ] {
+            assert!(!is_usb_serial_name(no), "{no} should not match");
+        }
+    }
+
+    #[test]
+    fn serial_summary_reports_empty_and_populated() {
+        let none = SerialAccess::none();
+        assert!(none.is_empty());
+        assert_eq!(none.summary(), "none detected on host");
+
+        let two = SerialAccess {
+            devices: vec![PathBuf::from("/dev/ttyUSB0"), PathBuf::from("/dev/ttyACM0")],
+            gids: vec![20],
+            majors: vec![166, 188],
+            udev: None,
+        };
+        assert!(!two.is_empty());
+        assert_eq!(
+            two.summary(),
+            "/dev/ttyUSB0 /dev/ttyACM0 (bound only with --serial)"
+        );
+        assert_eq!(
+            two.launch_note(),
+            "serial devices bound: /dev/ttyUSB0 /dev/ttyACM0"
+        );
+
+        let with_udev = SerialAccess {
+            udev: Some(PathBuf::from("/run/udev")),
+            ..two
+        };
+        assert_eq!(
+            with_udev.launch_note(),
+            "serial devices bound: /dev/ttyUSB0 /dev/ttyACM0, udev db /run/udev read-only"
+        );
+    }
+
+    /// The docker flags are the contract: every node as `--device`, every
+    /// owning group re-added, a wildcard cgroup rule per major, and the udev
+    /// db read-only when present.
+    #[test]
+    fn serial_apply_emits_device_group_and_cgroup_flags() {
+        let access = SerialAccess {
+            devices: vec![PathBuf::from("/dev/ttyUSB0"), PathBuf::from("/dev/ttyACM0")],
+            gids: vec![20],
+            majors: vec![166, 188],
+            udev: Some(PathBuf::from("/run/udev")),
+        };
+        let mut cmd = Command::new("docker");
+        access.apply(&mut cmd);
+        let args: Vec<String> = cmd
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            args,
+            [
+                "--device",
+                "/dev/ttyUSB0",
+                "--device",
+                "/dev/ttyACM0",
+                "--group-add",
+                "20",
+                "--device-cgroup-rule",
+                "c 166:* rmw",
+                "--device-cgroup-rule",
+                "c 188:* rmw",
+                "--mount",
+                "type=bind,src=/run/udev,dst=/run/udev,readonly",
+            ]
+        );
+
+        // Root-owned nodes and no udev db: devices still bind, nothing else.
+        let bare = SerialAccess {
+            devices: vec![PathBuf::from("/dev/ttyACM0")],
+            gids: vec![],
+            majors: vec![166],
+            udev: None,
+        };
+        let mut cmd = Command::new("docker");
+        bare.apply(&mut cmd);
+        let args: Vec<String> = cmd
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            args,
+            [
+                "--device",
+                "/dev/ttyACM0",
+                "--device-cgroup-rule",
+                "c 166:* rmw"
+            ]
+        );
+    }
+
+    /// An explicit `--serial-dev` naming something that isn't a device node
+    /// (or doesn't exist) must fail before any image build, not surface as a
+    /// docker error.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn serial_dev_rejects_non_devices() {
+        let dir = tempfile::tempdir().unwrap();
+        let plain = dir.path().join("not-a-tty");
+        std::fs::write(&plain, b"").unwrap();
+        let err = require_serial(&SerialRequest::Devices(vec![plain.clone()]))
+            .err()
+            .expect("a regular file is not a serial device");
+        assert!(
+            err.to_string().contains("not a character device"),
+            "{err:#}"
+        );
+
+        let missing = dir.path().join("ttyUSB9");
+        let err = require_serial(&SerialRequest::Devices(vec![missing]))
+            .err()
+            .expect("a missing path cannot be bound");
+        assert!(err.to_string().contains("cannot resolve"), "{err:#}");
+    }
+
+    /// `/dev/null` is a character device on every Linux box, so it stands in
+    /// for a board here: the node binds, its major is read off the inode, and
+    /// duplicates (a symlink and its target) collapse to one `--device`.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn serial_dev_resolves_symlinks_and_dedups() {
+        use std::os::unix::fs::MetadataExt;
+        let dir = tempfile::tempdir().unwrap();
+        let link = dir.path().join("by-id-style-link");
+        std::os::unix::fs::symlink("/dev/null", &link).unwrap();
+        let access = require_serial(&SerialRequest::Devices(vec![
+            link,
+            PathBuf::from("/dev/null"),
+        ]))
+        .unwrap();
+        assert_eq!(access.devices, vec![PathBuf::from("/dev/null")]);
+        let rdev = std::fs::metadata("/dev/null").unwrap().rdev();
+        assert_eq!(access.majors, vec![libc::major(rdev)]);
+        // /dev/null is root:root — no supplementary group to hand out.
+        assert!(access.gids.is_empty());
     }
 
     #[test]

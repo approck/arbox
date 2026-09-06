@@ -31,6 +31,13 @@ ENV DEBIAN_FRONTEND=noninteractive
 #   - protobuf-compiler for tonic/prost.
 #   - Database CLI clients: psql, redis-cli, mysql.
 #   - gdb for debugging.
+#   - Embedded / serial userspace: libudev-dev (espflash and anything on
+#     serialport-rs link libudev to enumerate ports), dfu-util (ESP32-S2/S3
+#     DFU flashing), picocom (a serial terminal for when `espflash monitor`
+#     is the wrong shape). The device nodes themselves are NOT in the image —
+#     they come in at runtime, only under `arbox --serial`. The Xtensa/RISC-V
+#     Rust toolchains are host-side (`espup install` into ~/.rustup, mounted
+#     read-only) and espflash/ldproxy are `cargo install`ed into ~/.cargo/bin.
 #   - Audio userspace: sox (its `rec`/`play` front-ends are what claude's
 #     /voice records with) plus libsox-fmt-all for the pulse/alsa/format
 #     backends, alsa-utils + pulseaudio-utils to inspect devices
@@ -47,6 +54,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
       protobuf-compiler \
       postgresql-client redis-tools default-mysql-client \
       gdb \
+      libudev-dev dfu-util picocom \
       ca-certificates curl git git-lfs \
       vim nano less sudo jq unzip zip xz-utils \
       ripgrep fd-find bat tree tmux shellcheck \

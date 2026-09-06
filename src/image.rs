@@ -297,5 +297,6 @@ pub fn print_status(profile: Option<&str>) -> Result<()> {
     }
     println!("network: host");
     println!("audio:   {}", crate::launch::detect_audio(&host).summary());
+    println!("serial:  {}", crate::launch::detect_serial().summary());
     Ok(())
 }

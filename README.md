@@ -81,6 +81,14 @@ or a process that you intentionally gave access to your mounted credentials.
   supplementary group inside the container, which grants that access even if
   your host user isn't in that group. See
   [Audio](#audio---voice).
+- **USB serial devices are NOT bound unless you pass `--serial`.** With the
+  flag, every `/dev/ttyUSB*` and `/dev/ttyACM*` node on the host (or just the
+  ones named with `--serial-dev`) is passed through with `--device`, the
+  owning group (usually `dialout`) is added inside the container, and the
+  host's udev database under `/run/udev` is mounted read-only so port
+  enumeration can identify boards. That is a live link to whatever hardware
+  is plugged in — flashing a bricked firmware is a real outcome — so it stays
+  opt-in and per-invocation. See [USB serial](#usb-serial---serial).
 - **Host UID/GID are mirrored** so files written from the container are owned
   by you on the host.
 - **The container uses host networking** (`--network host`) because coding
@@ -186,7 +194,7 @@ clear message.
 | `arbox run    [FLAGS] -- CMD...`  | Run a one-off command inside the container. |
 | `arbox update`                  | Refresh the baked-in agents (claude, codex, opencode, agy, grok) to their latest published versions, rebuilding only the agent layers (quick — the apt/node/playwright layers stay cached). Builds the image from scratch if it doesn't exist yet. |
 | `arbox update --force`          | Full clean rebuild of the entire image (`--no-cache`): re-runs apt, node, the Playwright browser downloads, everything. |
-| `arbox status`                  | Show host facts, mount layout, image presence, network mode, and detected host audio. Works outside a git repository (skips the workspace mount in that case). |
+| `arbox status`                  | Show host facts, mount layout, image presence, network mode, and detected host audio and USB serial devices. Works outside a git repository (skips the workspace mount in that case). |
 | `arbox clean`                   | Remove every arbox image whose tag has the current host's prefix. |
 
 `claude`, `codex`, `opencode`, `agy`, `grok`, `playwright`, `bash`, and `run`
@@ -256,6 +264,83 @@ with a fallback to real hardware, so ALSA-only callers work in either mode.
 `--voice` is Linux-only. It errors out immediately on both Windows and macOS,
 since Docker Desktop has no way to hand host sound devices to a Linux
 container on either platform.
+
+### USB serial (`--serial`)
+
+No serial port reaches the container by default. Pass `--serial` (global, on
+any launch verb) to bind the host's USB serial devices in — what you need to
+flash and monitor a microcontroller dev board (ESP32, RP2040, STM32 Nucleo,
+Arduino…) from inside the sandbox:
+
+```bash
+arbox bash --serial                          # every /dev/ttyUSB* + /dev/ttyACM*
+arbox claude --serial-dev /dev/ttyACM0       # just this one board
+arbox --serial-dev /dev/serial/by-id/usb-Espressif_USB_JTAG_serial_debug_unit_* run -- cargo run --release
+```
+
+`--serial` auto-detects and binds every `ttyUSB<n>` (CP210x / CH340 / FTDI
+bridges) and `ttyACM<n>` (CDC-ACM: the native USB-Serial-JTAG on ESP32-S3,
+C3, C6, H2, and most Arduino-style boards) node. `--serial-dev PATH`
+(repeatable, implies `--serial`) narrows that to the named nodes and accepts
+`/dev/serial/by-id/...` symlinks, which resolve to the real node. Legacy
+`ttyS<n>` UARTs are never bound: every machine has those whether or not
+anything is plugged in, and binding them would let `--serial` succeed on a
+host with no board.
+
+| Host thing                                | How it's passed |
+|-------------------------------------------|-----------------|
+| Each device node                          | `--device /dev/ttyUSB0`, plus `--group-add` for the group owning the node (`dialout`, read off the inode rather than assumed) — `--user UID:GID` drops the host user's supplementary groups, so without it the mode-0660 nodes stay unopenable. |
+| The node's char-device major (188 for `ttyUSB`, 166 for `ttyACM`) | `--device-cgroup-rule "c 188:* rmw"`. Boards with a native USB-Serial-JTAG (S3/C3) drop off the bus when they enter download mode mid-flash. If the board comes back under the same name the existing node keeps working; if it comes back as `ttyACM1`, the rule lets you `sudo mknod /dev/ttyACM1 c 166 1` inside the container instead of relaunching. |
+| udev database `/run/udev`                 | Bind-mounted read-only when present, so libudev-based port enumeration (`espflash`, anything on `serialport-rs`) sees USB vendor/product ids and can pick the board by name. Without it those tools still work, but need an explicit `--port`. |
+
+`--serial` fails immediately (before any image build) when the host has no
+matching device, and `--serial-dev` fails when a path doesn't exist or isn't
+a character device. Every launch prints what it bound, on stderr so piped
+`arbox run` output stays clean:
+
+```
+arbox: serial devices bound: /dev/ttyACM0, udev db /run/udev read-only
+```
+
+`arbox status` reports what it can see:
+
+```
+serial:  /dev/ttyACM0 (bound only with --serial)
+```
+
+The image ships the userspace side: `libudev-dev` (so `cargo install
+espflash` builds in the box), `dfu-util` for ESP32-S2/S3 DFU flashing, and
+`picocom` as a plain serial terminal. Networking is unchanged, so Wi-Fi
+debugging, mDNS discovery, OTA uploads, and `espflash monitor` all behave as
+they do on the host.
+
+`--serial` is Linux-only. It errors out immediately on both Windows and macOS,
+since Docker Desktop's Linux VM has no USB passthrough on either platform.
+
+#### ESP32 toolchains
+
+The flashing tools are ordinary cargo installs and land in `~/.cargo/bin`,
+which is already shared with the container:
+
+```bash
+cargo install espflash cargo-espflash ldproxy
+```
+
+The compiler side is host work, because `~/.rustup` is mounted read-only:
+
+- **RISC-V chips (C3, C6, H2)** build with the stock toolchain. On the host,
+  `rustup target add riscv32imac-unknown-none-elf` (or `riscv32imc-` for the
+  C3) and `rustup component add rust-src`; the container sees both through the
+  existing mount.
+- **Xtensa chips (ESP32, S2, S3)** need Espressif's forked toolchain. Run
+  `espup install` on the host — it installs the `esp` toolchain into
+  `~/.rustup` and the Xtensa GCC alongside it, both of which flow in through
+  the read-only mount — and `source ~/export-esp.sh` inside the box before
+  building, so `LIBCLANG_PATH` and `PATH` point at them.
+- **`std` projects on ESP-IDF** (`esp-idf-sys`) additionally write several
+  gigabytes of SDK and a Python venv under `~/.espressif`, which is not one of
+  arbox's persisted mounts. Add `--rw ~/.espressif` so that survives across
+  launches. Bare-metal `no_std` projects on `esp-hal` avoid this entirely.
 
 ### Auth profiles (`--profile`)
 
@@ -363,8 +448,10 @@ Files created inside the container will appear to be owned by UID/GID 1000 in th
 6. `docker run --rm -i --network host --user UID:GID --workdir <cwd>` runs
    the selected command with host-shaped paths and inherited stdio. `-t` is
    added only when stdin is an interactive terminal. The host Wayland socket
-   is added when the session has one, and `--voice` adds the sound-server
-   socket and/or `--device /dev/snd` (see [Audio](#audio---voice)).
+   is added when the session has one, `--voice` adds the sound-server
+   socket and/or `--device /dev/snd` (see [Audio](#audio---voice)), and
+   `--serial` adds `--device` for each USB serial node (see
+   [USB serial](#usb-serial---serial)).
 
 ## Customization
 
