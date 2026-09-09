@@ -61,9 +61,9 @@ impl MountSpec {
 }
 
 /// One coding agent's registry entry. This table is the single source of
-/// truth for the per-agent state layout: `mount_specs` derives the mount list
-/// from it, `ensure_agent_state` pre-creates its paths, and `selected_agents`
-/// resolves which of them a given launch mounts — add an agent (or move a
+/// truth for the per-agent state layout: `select` resolves which of them a
+/// given launch mounts, `mount_specs` derives the mount list from that, and
+/// `ensure_state` pre-creates the host-side paths — add an agent (or move a
 /// path) here and every consumer follows. The Dockerfile's XDG parent-dir
 /// pre-creation (`install -d` in src/Dockerfile) must cover the parents of
 /// any nested path listed here.
@@ -506,10 +506,15 @@ fn ensure_state(host: &HostContext, sel: &Selection, profile: Option<&str>) -> R
 }
 
 /// What `arbox status` should show. Status isn't a launch, so there is no
-/// verb to take a default from: it reports the flags as given, over the same
-/// empty default `bash`, `run` and `playwright` use.
+/// verb to take a default from — and defaulting to nothing would make
+/// `arbox --profile NAME status` print no agent mounts at all, which is
+/// exactly the command you'd run to check that a profile redirects where you
+/// expect. So it defaults to every agent's state, i.e. the full map of what
+/// some verb could mount, with the printed note explaining that any one launch
+/// mounts a subset. `--no-mount-<name>` still subtracts from it.
 pub fn status_selection(ov: &MountOverrides) -> Selection {
-    select(&[], false, ov)
+    let all: Vec<&str> = AGENTS.iter().map(|a| a.name).collect();
+    select(&all, false, ov)
 }
 
 /// Every agent verb name, for the `arbox status` reminder that each mounts

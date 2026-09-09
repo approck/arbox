@@ -255,13 +255,14 @@ RUN npm install -g "wrangler@${WRANGLER_VERSION}"
 ARG AGENT_REFRESH=0
 RUN echo "arbox agent refresh token: ${AGENT_REFRESH}" >/dev/null
 
-# All five coding agents baked into the image. The host's user config dirs
-# (~/.claude, ~/.claude.json, ~/.codex, ~/.config/opencode,
-# ~/.local/share/opencode, ~/.gemini, ~/.config/antigravity, ~/.grok) are
-# still bind-mounted from the host so credentials and history persist across
-# container invocations, but the BINARIES live in the image — no host install
-# needed, and the host's ~/.local/bin shadow is no longer relied on for agent
-# launches.
+# All five coding agents baked into the image. Each agent's host config dir
+# (~/.claude + ~/.claude.json, ~/.codex, ~/.config/opencode +
+# ~/.local/share/opencode, ~/.gemini + ~/.config/antigravity, ~/.grok) is
+# bind-mounted by that agent's OWN verb and no other, so credentials and
+# history persist across container invocations without any agent seeing
+# another's (see `select` in src/launch.rs). The BINARIES live in the image —
+# no host install needed, and the host's ~/.local/bin shadow is no longer
+# relied on for agent launches.
 #
 # claude + codex + opencode via npm (official distribution channels; the
 # opencode-ai package resolves the right platform binary through its

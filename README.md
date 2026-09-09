@@ -69,7 +69,7 @@ or a process that you intentionally gave access to your mounted credentials.
   `~/.config/antigravity`, and `arbox grok` mounts `~/.grok`. `arbox bash`,
   `arbox run`, and `arbox playwright` mount **none** of them. Override in
   either direction on any verb with `--mount-<agent>` / `--no-mount-<agent>`
-  (see [Agent state mounts](#agent-state-mounts)). A compromised agent could
+  (see [State mounts](#state-mounts)). A compromised agent could
   modify whatever it is given. Note that
   opencode's data dir is not purely inert state: opencode downloads helper
   executables (LSP servers, ripgrep, fzf) into `~/.local/share/opencode/bin`,
@@ -214,15 +214,15 @@ clear message.
 | `arbox status`                  | Show host facts, mount layout, image presence, network mode, whether the wrangler config dir is bound, and detected host audio and USB serial devices. Works outside a git repository (skips the workspace mount in that case). |
 | `arbox clean`                   | Remove every arbox image whose tag has the current host's prefix. |
 
-`claude`, `codex`, `opencode`, `agy`, `grok`, `playwright`, `bash`, and `run`
-must be invoked from inside a git repository — they mount the git toplevel as
+`claude`, `codex`, `opencode`, `agy`, `grok`, `playwright`, `wrangler`,
+`bash`, and `run` must be invoked from inside a git repository — they mount the git toplevel as
 the workspace and `cd` into your current directory. `status`, `update`, and
 `clean` do not require a repo.
 
 ### Extra bind-mount flags
 
-`claude`, `codex`, `opencode`, `agy`, `grok`, `playwright`, `bash`, and `run`
-accept zero or more `--rw <PATH>` and
+`claude`, `codex`, `opencode`, `agy`, `grok`, `playwright`, `wrangler`,
+`bash`, and `run` accept zero or more `--rw <PATH>` and
 `--ro <PATH>` options. Each path is canonicalized (relative paths and
 symlinks resolve against the host filesystem) and mounted at the same
 absolute path inside the container.
@@ -276,7 +276,11 @@ is not a blanket grant of every credential you own — but it means the
 agent-from-a-shell workflow needs `--mount-<agent>` spelled out. Running the
 agent verb directly (`arbox claude`) needs nothing.
 
-`arbox status` shows the resolved list, and honors these flags:
+`arbox status` lists **every** agent's state paths — the full map of what some
+verb could mount, so `arbox --profile NAME status` still shows you where a
+profile redirects — and spells out that any one launch mounts a subset.
+`--no-mount-<name>` subtracts from that list, `--mount-wrangler` adds the
+wrangler config dir:
 
 ```
 $ arbox status
@@ -289,6 +293,8 @@ state mounts:
   `arbox wrangler` mounts wrangler's config dir (your Cloudflare login);
   bash, run and playwright mount none of it.
   override on any verb with --mount-<name> / --no-mount-<name>.
+  wrangler config: /home/jason/.config/.wrangler (bound only with `arbox wrangler` or --mount-wrangler)
+  (the mounts above list every agent's state — one launch mounts a subset.)
 ```
 
 ### Audio (`--voice`)
@@ -520,10 +526,10 @@ container is Linux and arbox forwards no XDG variables into it. The directory
 is created on the first launch that mounts it so the bind mount attaches, and
 it is shared across `--profile`s.
 
-`arbox status` reports the state either way:
+`arbox status` reports the state either way, under `state mounts:`:
 
 ```
-wrangler: /home/jason/.config/.wrangler (bound only with `arbox wrangler` or --mount-wrangler)
+  wrangler config: /home/jason/.config/.wrangler (bound only with `arbox wrangler` or --mount-wrangler)
 ```
 
 #### Logging in from inside the container

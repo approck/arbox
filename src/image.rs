@@ -300,6 +300,11 @@ pub fn print_status(profile: Option<&str>, mounts: &crate::launch::MountOverride
     println!("  `arbox wrangler` mounts wrangler's config dir (your Cloudflare login);");
     println!("  bash, run and playwright mount none of it.");
     println!("  override on any verb with --mount-<name> / --no-mount-<name>.");
+    println!(
+        "  wrangler config: {}",
+        crate::launch::wrangler_summary(&host, &sel)
+    );
+    println!("  (the mounts above list every agent's state — one launch mounts a subset.)");
 
     let t = tag(&host);
     println!("image:");
@@ -313,6 +318,5 @@ pub fn print_status(profile: Option<&str>, mounts: &crate::launch::MountOverride
     println!("network: host");
     println!("audio:   {}", crate::launch::detect_audio(&host).summary());
     println!("serial:  {}", crate::launch::detect_serial().summary());
-    println!("wrangler: {}", crate::launch::wrangler_summary(&host, &sel));
     Ok(())
 }
