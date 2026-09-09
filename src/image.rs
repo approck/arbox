@@ -220,7 +220,12 @@ pub fn clean() -> Result<()> {
     Ok(())
 }
 
-pub fn print_status(profile: Option<&str>) -> Result<()> {
+/// `claude, codex, opencode, agy, grok` — the verb names, for the status note.
+fn agents_note() -> String {
+    crate::launch::agent_names().join(", ")
+}
+
+pub fn print_status(profile: Option<&str>, mounts: &crate::launch::MountOverrides) -> Result<()> {
     // Always print whatever we managed to detect, even on unsupported hosts.
     let host = match host::detect() {
         Ok(h) => h,
@@ -265,7 +270,8 @@ pub fn print_status(profile: Option<&str>) -> Result<()> {
     }
 
     println!("mounts (host -> container path):");
-    for m in crate::launch::mount_specs(&host, profile) {
+    let sel = crate::launch::status_selection(mounts);
+    for m in crate::launch::mount_specs(&host, profile, &sel) {
         let mode = if m.read_only { "ro" } else { "rw" };
         let exists = m.src.exists();
         let suffix = match (exists, m.required) {
@@ -286,6 +292,15 @@ pub fn print_status(profile: Option<&str>) -> Result<()> {
         }
     }
 
+    println!("state mounts:");
+    println!(
+        "  each agent verb mounts only its own state ({});",
+        agents_note()
+    );
+    println!("  `arbox wrangler` mounts wrangler's config dir (your Cloudflare login);");
+    println!("  bash, run and playwright mount none of it.");
+    println!("  override on any verb with --mount-<name> / --no-mount-<name>.");
+
     let t = tag(&host);
     println!("image:");
     if image_exists(&t)? {
@@ -298,5 +313,6 @@ pub fn print_status(profile: Option<&str>) -> Result<()> {
     println!("network: host");
     println!("audio:   {}", crate::launch::detect_audio(&host).summary());
     println!("serial:  {}", crate::launch::detect_serial().summary());
+    println!("wrangler: {}", crate::launch::wrangler_summary(&host, &sel));
     Ok(())
 }

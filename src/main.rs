@@ -52,6 +52,75 @@ struct Cli {
     #[arg(long = "serial-dev", value_name = "DEV", global = true)]
     serial_dev: Vec<PathBuf>,
 
+    // Per-agent state mounts. Each agent verb mounts its OWN state and
+    // nothing else; every other verb (bash, run, playwright) mounts none. So
+    // `arbox codex` cannot read your Claude credentials or session history,
+    // and `arbox bash` starts with no agent credentials at all. These flags
+    // override that in either direction, on any verb.
+    /// Mount Claude Code's `~/.claude` + `~/.claude.json` (global), whatever the verb's default.
+    #[arg(long = "mount-claude", global = true)]
+    mount_claude: bool,
+
+    /// Leave Claude Code's `~/.claude` + `~/.claude.json` unmounted (global), even on `arbox claude`.
+    #[arg(
+        long = "no-mount-claude",
+        global = true,
+        conflicts_with = "mount_claude"
+    )]
+    no_mount_claude: bool,
+
+    /// Mount Codex CLI's `~/.codex` (global), whatever the verb's default.
+    #[arg(long = "mount-codex", global = true)]
+    mount_codex: bool,
+
+    /// Leave Codex CLI's `~/.codex` unmounted (global), even on `arbox codex`.
+    #[arg(long = "no-mount-codex", global = true, conflicts_with = "mount_codex")]
+    no_mount_codex: bool,
+
+    /// Mount OpenCode's `~/.config/opencode` + `~/.local/share/opencode` (global), whatever the verb's default.
+    #[arg(long = "mount-opencode", global = true)]
+    mount_opencode: bool,
+
+    /// Leave OpenCode's `~/.config/opencode` + `~/.local/share/opencode` unmounted (global), even on `arbox opencode`.
+    #[arg(
+        long = "no-mount-opencode",
+        global = true,
+        conflicts_with = "mount_opencode"
+    )]
+    no_mount_opencode: bool,
+
+    /// Mount Antigravity's `~/.gemini` + `~/.config/antigravity` (global), whatever the verb's default.
+    #[arg(long = "mount-agy", global = true)]
+    mount_agy: bool,
+
+    /// Leave Antigravity's `~/.gemini` + `~/.config/antigravity` unmounted (global), even on `arbox agy`.
+    #[arg(long = "no-mount-agy", global = true, conflicts_with = "mount_agy")]
+    no_mount_agy: bool,
+
+    /// Mount Grok Build's `~/.grok` (global), whatever the verb's default.
+    #[arg(long = "mount-grok", global = true)]
+    mount_grok: bool,
+
+    /// Leave Grok Build's `~/.grok` unmounted (global), even on `arbox grok`.
+    #[arg(long = "no-mount-grok", global = true, conflicts_with = "mount_grok")]
+    no_mount_grok: bool,
+
+    /// Mount wrangler's global config dir — the host's Cloudflare login —
+    /// (global), whatever the verb's default. On by default for
+    /// `arbox wrangler`, off for every other verb.
+    #[arg(long = "mount-wrangler", global = true)]
+    mount_wrangler: bool,
+
+    /// Leave wrangler's global config dir unmounted (global), even on
+    /// `arbox wrangler`. The local dev server needs no Cloudflare credential:
+    /// it simulates KV, R2, D1, Durable Objects and Queues on the machine.
+    #[arg(
+        long = "no-mount-wrangler",
+        global = true,
+        conflicts_with = "mount_wrangler"
+    )]
+    no_mount_wrangler: bool,
+
     /// Use a named auth profile (global). Sources each agent's ENTIRE state
     /// tree (auth + history + memories + sessions + settings) from
     /// `~/.arbox/profiles/NAME/` instead of the standard host locations, so a
@@ -130,6 +199,19 @@ enum Cmd {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
+    /// Run the Cloudflare Workers CLI: `arbox wrangler dev`.
+    ///
+    /// Runs the wrangler baked into the image against the current workspace,
+    /// so the host needs neither node nor wrangler installed. This verb — and
+    /// only this verb — mounts wrangler's config dir, so your `wrangler login`
+    /// carries over and persists. `wrangler dev` itself needs no Cloudflare
+    /// credential: it runs the Worker locally in workerd with KV, R2, D1,
+    /// Durable Objects and Queues simulated on the machine. All trailing args
+    /// are forwarded.
+    Wrangler {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
     /// Run an arbitrary command: `arbox run -- cargo test`.
     Run {
         #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
@@ -192,12 +274,27 @@ fn main() -> ExitCode {
     } else {
         None
     };
+    // Table-driven so adding an agent means one row here, not a new branch.
+    let mut mounts = launch::MountOverrides::default();
+    for (name, on, off) in [
+        ("claude", cli.mount_claude, cli.no_mount_claude),
+        ("codex", cli.mount_codex, cli.no_mount_codex),
+        ("opencode", cli.mount_opencode, cli.no_mount_opencode),
+        ("agy", cli.mount_agy, cli.no_mount_agy),
+        ("grok", cli.mount_grok, cli.no_mount_grok),
+        ("wrangler", cli.mount_wrangler, cli.no_mount_wrangler),
+    ] {
+        if on || off {
+            mounts.set(name, on);
+        }
+    }
     let opts = launch::Opts {
         rw,
         ro: cli.ro,
         profile: cli.profile,
         voice: cli.voice,
         serial,
+        mounts,
     };
     match dispatch(cli.cmd, opts) {
         Ok(code) => code,
@@ -217,9 +314,12 @@ fn dispatch(cmd: Cmd, opts: launch::Opts) -> Result<ExitCode> {
         Cmd::Grok { args } => launch::run_grok(args, opts),
         Cmd::Bash => launch::run_bash(opts),
         Cmd::Playwright { args } => launch::run_playwright(args, opts),
+        Cmd::Wrangler { args } => launch::run_wrangler(args, opts),
         Cmd::Run { cmd } => launch::run_argv(cmd, opts),
         Cmd::Update { force } => image::update_image(force).map(|_| ExitCode::SUCCESS),
-        Cmd::Status => image::print_status(opts.profile.as_deref()).map(|_| ExitCode::SUCCESS),
+        Cmd::Status => {
+            image::print_status(opts.profile.as_deref(), &opts.mounts).map(|_| ExitCode::SUCCESS)
+        }
         Cmd::Clean => image::clean().map(|_| ExitCode::SUCCESS),
     }
 }

@@ -231,8 +231,14 @@ RUN npm install -g "pnpm@${PNPM_VERSION}"
 # all reachable from the host browser because arbox runs with `--network
 # host` (on Windows/macOS that needs Docker Desktop's opt-in host networking).
 #
-# Note that the image has no browser and no xdg-open, so an interactive login
-# in here wants `wrangler login --device` (or `--browser false`).
+# No Cloudflare credential is present except under `arbox wrangler`, the verb
+# that runs this binary and mounts the config dir wrangler caches its OAuth
+# token in (see `wrangler_config_source` in src/launch.rs). Every other verb
+# leaves it out, which costs nothing: `wrangler dev` runs the Worker locally in
+# workerd with KV, R2, D1, Durable Objects and Queues simulated on the machine,
+# so Workers are developed and tested without a deploy-capable token at all.
+# Note also that the image has no browser and no xdg-open, so an interactive
+# login in here wants `wrangler login --device` (or `--browser false`).
 ARG WRANGLER_VERSION=4.130.0
 RUN npm install -g "wrangler@${WRANGLER_VERSION}"
 

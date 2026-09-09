@@ -60,11 +60,17 @@ or a process that you intentionally gave access to your mounted credentials.
   (bumped with `arbox update`), so mounting the host copies would only let
   them shadow the baked binaries on `PATH`. Only agent *state* is shared —
   see the next bullet.
-- **Agent data dirs are mounted read-write** so config, credentials, history,
-  memories, and sessions persist across container rebuilds: `~/.claude` +
-  `~/.claude.json` (claude), `~/.codex`, `~/.config/opencode` +
-  `~/.local/share/opencode` (opencode), `~/.gemini` + `~/.config/antigravity`
-  (agy), and `~/.grok`. A compromised agent could modify these. Note that
+- **Each agent verb mounts only its OWN data dir, read-write**, so config,
+  credentials, history, memories, and sessions persist across container
+  rebuilds without any agent seeing another's: `arbox claude` mounts
+  `~/.claude` + `~/.claude.json` and nothing else, `arbox codex` mounts
+  `~/.codex`, `arbox opencode` mounts `~/.config/opencode` +
+  `~/.local/share/opencode`, `arbox agy` mounts `~/.gemini` +
+  `~/.config/antigravity`, and `arbox grok` mounts `~/.grok`. `arbox bash`,
+  `arbox run`, and `arbox playwright` mount **none** of them. Override in
+  either direction on any verb with `--mount-<agent>` / `--no-mount-<agent>`
+  (see [Agent state mounts](#agent-state-mounts)). A compromised agent could
+  modify whatever it is given. Note that
   opencode's data dir is not purely inert state: opencode downloads helper
   executables (LSP servers, ripgrep, fzf) into `~/.local/share/opencode/bin`,
   so this mount carries executables in both directions — a compromised
@@ -81,6 +87,16 @@ or a process that you intentionally gave access to your mounted credentials.
   supplementary group inside the container, which grants that access even if
   your host user isn't in that group. See
   [Audio](#audio---voice).
+- **Your Cloudflare login reaches the container only under `arbox wrangler`.**
+  That verb runs the image's wrangler against your account, so it mounts
+  wrangler's global config dir read-write; every other verb leaves it out of
+  the mount list entirely, and holds no Cloudflare credential at all. The token
+  cached there is refreshable and account-wide — it can deploy, read your
+  zones, and write secrets — so `arbox claude` deliberately doesn't get it.
+  `--mount-wrangler` / `--no-mount-wrangler` override either way. Note that the
+  local development loop needs no credential regardless: `wrangler dev`
+  simulates KV, R2, D1, Durable Objects and Queues on the machine. See
+  [Cloudflare / wrangler](#cloudflare--wrangler).
 - **USB serial devices are NOT bound unless you pass `--serial`.** With the
   flag, every `/dev/ttyUSB*` and `/dev/ttyACM*` node on the host (or just the
   ones named with `--serial-dev`) is passed through with `--device`, the
@@ -184,17 +200,18 @@ clear message.
 
 | Command                         | Description |
 |---------------------------------|-------------|
-| `arbox claude [FLAGS] -- ARGS...` | Run Claude Code with `--dangerously-skip-permissions`. Binary baked into image; `~/.claude` + `~/.claude.json` mount from the host if present. With `--voice`, starts with voice mode already enabled. |
-| `arbox codex  [FLAGS] -- ARGS...` | Run Codex CLI with `--dangerously-bypass-approvals-and-sandbox`. Binary baked into image; `~/.codex` mounts from the host if present. |
-| `arbox opencode [FLAGS] -- ARGS...` | Run the OpenCode TUI. Binary baked into image; `~/.config/opencode` (config) and `~/.local/share/opencode` (auth in `auth.json`, sessions) mount from the host. Host-local providers like Ollama on `localhost:11434` work via host networking on Linux; on Windows and macOS, Docker Desktop reaches them only with its opt-in host-networking feature enabled. |
-| `arbox agy    [FLAGS] -- ARGS...` | Run Google Antigravity's `agy` CLI. Binary baked into image; `~/.gemini` and `~/.config/antigravity` mount from the host. First-time auth uses agy's SSH-style URL+code flow since libsecret isn't reachable inside the container. |
-| `arbox grok   [FLAGS] -- ARGS...` | Run xAI's Grok Build CLI. Binary baked into image; `~/.grok` mounts from the host (token lives in `~/.grok/auth.json`). |
-| `arbox bash   [FLAGS]`          | Open an interactive login bash inside the container. |
-| `arbox playwright [FLAGS] -- ARGS...` | Run the Playwright CLI (`test`, `codegen`, `show-report`, …). Image ships Node + Playwright + chromium + firefox. |
-| `arbox run    [FLAGS] -- CMD...`  | Run a one-off command inside the container. |
+| `arbox claude [FLAGS] -- ARGS...` | Run Claude Code with `--dangerously-skip-permissions`. Binary baked into image; `~/.claude` + `~/.claude.json` mount from the host, and no other agent's state does. With `--voice`, starts with voice mode already enabled. |
+| `arbox codex  [FLAGS] -- ARGS...` | Run Codex CLI with `--dangerously-bypass-approvals-and-sandbox`. Binary baked into image; `~/.codex` mounts from the host, and no other agent's state does. |
+| `arbox opencode [FLAGS] -- ARGS...` | Run the OpenCode TUI. Binary baked into image; `~/.config/opencode` (config) and `~/.local/share/opencode` (auth in `auth.json`, sessions) mount from the host, and no other agent's state does. Host-local providers like Ollama on `localhost:11434` work via host networking on Linux; on Windows and macOS, Docker Desktop reaches them only with its opt-in host-networking feature enabled. |
+| `arbox agy    [FLAGS] -- ARGS...` | Run Google Antigravity's `agy` CLI. Binary baked into image; `~/.gemini` and `~/.config/antigravity` mount from the host, and no other agent's state does. First-time auth uses agy's SSH-style URL+code flow since libsecret isn't reachable inside the container. |
+| `arbox grok   [FLAGS] -- ARGS...` | Run xAI's Grok Build CLI. Binary baked into image; `~/.grok` mounts from the host (token lives in `~/.grok/auth.json`), and no other agent's state does. |
+| `arbox bash   [FLAGS]`          | Open an interactive login bash inside the container. No agent state is mounted — add `--mount-<agent>` to run one from the shell. |
+| `arbox playwright [FLAGS] -- ARGS...` | Run the Playwright CLI (`test`, `codegen`, `show-report`, …). Image ships Node + Playwright + chromium + firefox. No agent state is mounted. |
+| `arbox wrangler [FLAGS] -- ARGS...` | Run the Cloudflare Workers CLI (`dev`, `deploy`, `d1`, …) from the image, so the host needs neither node nor wrangler. The only verb that mounts wrangler's config dir, so your `wrangler login` carries over. |
+| `arbox run    [FLAGS] -- CMD...`  | Run a one-off command inside the container. No agent state is mounted. |
 | `arbox update`                  | Refresh the baked-in agents (claude, codex, opencode, agy, grok) to their latest published versions, rebuilding only the agent layers (quick — the apt/node/playwright layers stay cached). Builds the image from scratch if it doesn't exist yet. |
 | `arbox update --force`          | Full clean rebuild of the entire image (`--no-cache`): re-runs apt, node, the Playwright browser downloads, everything. |
-| `arbox status`                  | Show host facts, mount layout, image presence, network mode, and detected host audio and USB serial devices. Works outside a git repository (skips the workspace mount in that case). |
+| `arbox status`                  | Show host facts, mount layout, image presence, network mode, whether the wrangler config dir is bound, and detected host audio and USB serial devices. Works outside a git repository (skips the workspace mount in that case). |
 | `arbox clean`                   | Remove every arbox image whose tag has the current host's prefix. |
 
 `claude`, `codex`, `opencode`, `agy`, `grok`, `playwright`, `bash`, and `run`
@@ -217,6 +234,62 @@ arbox claude --rw ~/code/sibling-repo --ro ~/datasets/fixtures
 ```
 
 Required to exist on the host; launches fail loudly if a path is missing.
+
+### State mounts
+
+Each tool's credentials and history live in a dot-directory on your host, and
+**a launch mounts only the ones its verb needs**:
+
+| Verb | State mounted |
+|------|---------------|
+| `arbox claude`     | `~/.claude`, `~/.claude.json` |
+| `arbox codex`      | `~/.codex` |
+| `arbox opencode`   | `~/.config/opencode`, `~/.local/share/opencode` |
+| `arbox agy`        | `~/.gemini`, `~/.config/antigravity` |
+| `arbox grok`       | `~/.grok` |
+| `arbox wrangler`   | wrangler's config dir (`~/.config/.wrangler` on Linux) |
+| `arbox bash`, `arbox run`, `arbox playwright` | none |
+
+So `arbox codex` cannot read your Claude credentials, plans, or session
+history; `arbox claude` holds no Cloudflare token; and `arbox playwright test`
+holds nothing at all. This is the default; nothing is needed to get it.
+
+Two global flags override it in either direction, on any verb:
+
+```bash
+arbox bash --mount-claude                  # shell that can run claude
+arbox bash --mount-claude --mount-codex    # …or either of two
+arbox claude --no-mount-claude             # claude with throwaway state
+arbox run --mount-grok -- grok "summarize this diff"
+arbox bash --mount-wrangler                # shell that can deploy
+arbox wrangler --no-mount-wrangler dev     # local dev, no credential in the box
+```
+
+`--mount-<name>` adds that state whatever the verb's default;
+`--no-mount-<name>` removes it, including on the tool's own verb. Both exist
+for all six: `claude`, `codex`, `opencode`, `agy`, `grok`, `wrangler`.
+
+The consequence worth knowing: launching an agent from `arbox bash` without the
+matching flag gives you an *unauthenticated* agent that writes throwaway state
+inside the container and loses it on exit. That is intended — the sandbox shell
+is not a blanket grant of every credential you own — but it means the
+agent-from-a-shell workflow needs `--mount-<agent>` spelled out. Running the
+agent verb directly (`arbox claude`) needs nothing.
+
+`arbox status` shows the resolved list, and honors these flags:
+
+```
+$ arbox status
+mounts (host -> container path):
+  /home/jason/code/appcove/arbox (rw)
+  /home/jason/.cargo (rw)
+  ...
+state mounts:
+  each agent verb mounts only its own state (claude, codex, opencode, agy, grok);
+  `arbox wrangler` mounts wrangler's config dir (your Cloudflare login);
+  bash, run and playwright mount none of it.
+  override on any verb with --mount-<name> / --no-mount-<name>.
+```
 
 ### Audio (`--voice`)
 
@@ -369,12 +442,15 @@ Everything inside that tree — credentials, sessions (so `--resume` works),
 memories, settings, MCP config — is isolated to the profile and consistent
 with its own auth. The trade-off is intentional: a profile does **not** share
 memories or sessions with the default or with other profiles. Non-agent mounts
-(the workspace, the Rust toolchain, and read-only `~/.gitconfig`) stay shared
-regardless of profile, since git identity isn't tied to a subscription.
+(the workspace, the Rust toolchain, read-only `~/.gitconfig`, and — under
+`arbox wrangler` — wrangler's config dir) stay shared regardless of profile, since
+neither git identity nor a Cloudflare account is tied to an agent
+subscription.
 
-The profile tree is created on first launch of each agent verb (its dirs are
-made and `~/.arbox/profiles/<NAME>/.claude.json` is seeded with `{}` so the
-bind mounts attach); then `/login` inside that box populates it.
+The profile tree is created on first launch of each agent verb, for the agents
+that launch actually mounts (their dirs are made and
+`~/.arbox/profiles/<NAME>/.claude.json` is seeded with `{}` so the bind mounts
+attach); then `/login` inside that box populates it.
 
 ```bash
 arbox claude --profile personal          # first run: log in inside the box
@@ -386,6 +462,88 @@ arbox --profile personal status          # show the redirected mounts
 `~/.config/antigravity` move into the profile tree, whatever it persists there
 is isolated too. The default profile is unaffected — it keeps using your
 standard host locations.
+
+### Cloudflare / wrangler
+
+`arbox wrangler ...` runs the wrangler baked into the image against your
+current workspace, so **the host needs neither node nor wrangler installed**:
+
+```bash
+arbox wrangler dev
+arbox wrangler deploy
+arbox wrangler d1 execute my-db --command "select 1"
+```
+
+It is also the only verb that mounts wrangler's config dir, so a
+`wrangler login` — on the host or from inside the box — carries over and
+persists. Every other verb leaves that dir out of the mount list entirely, so
+`arbox claude` and `arbox bash` hold no Cloudflare credential.
+
+That is enough for the entire local development loop. `wrangler dev` runs your
+Worker locally in `workerd`, and simulates KV, R2, D1, Durable Objects, Queues,
+Cache, and service bindings on the machine, keeping their state in
+`<project>/.wrangler/state/` inside the workspace mount. No login, no account
+ID, no calls to Cloudflare. The same is true of `vitest` with
+`@cloudflare/vitest-pool-workers`, and of driving `miniflare` directly.
+
+```bash
+arbox wrangler dev                        # local: workerd + simulated bindings
+arbox wrangler --no-mount-wrangler dev    # …and provably no credential in the box
+```
+
+Credentials are only needed for commands that touch your account —
+`wrangler deploy`, `tail`, `secret put`, `versions`, remote `d1`/`kv` writes,
+and `wrangler dev --remote` — or for bindings with no local simulation:
+Workers AI (`env.AI` is always remote), Browser Rendering, Vectorize, mTLS, and
+(partly) Images. A Worker that binds one of those will reach for auth even in
+local dev.
+
+Understand what `arbox wrangler` shares. The OAuth token in that config dir is
+refreshable and account-wide: its scopes include `workers:write`, `d1:write`,
+`pages:write`, `zone:read`, `ssl_certs:write`, `secrets_store:write`, and
+`containers:write`. Anything running in *that* container can deploy with it —
+which is why no other verb gets it, and why `--no-mount-wrangler` exists for
+runs that shouldn't touch your account.
+
+For a narrower credential, use a scoped API token instead of an OAuth login:
+create one in the dashboard (My Profile → API Tokens, the "Edit Cloudflare
+Workers" template or narrower) and set `CLOUDFLARE_API_TOKEN` in the container
+shell. It is scoped to one account, revocable, carries no refresh token, and
+never lands in a file. No mount needed at all.
+
+The mount source follows wrangler's own per-platform resolution, so it is the
+same directory your host wrangler uses: a legacy `~/.wrangler` if you have one,
+else `$XDG_CONFIG_HOME/.wrangler`, else `~/.config/.wrangler` on Linux,
+`~/Library/Preferences/.wrangler` on macOS, and `%APPDATA%\xdg.config\.wrangler`
+on Windows. The container side is always `~/.config/.wrangler`, since the
+container is Linux and arbox forwards no XDG variables into it. The directory
+is created on the first launch that mounts it so the bind mount attaches, and
+it is shared across `--profile`s.
+
+`arbox status` reports the state either way:
+
+```
+wrangler: /home/jason/.config/.wrangler (bound only with `arbox wrangler` or --mount-wrangler)
+```
+
+#### Logging in from inside the container
+
+Plain `wrangler login` opens a browser, which the sandbox has no way to do — it
+spawns `xdg-open`, which isn't installed. Use either:
+
+```bash
+arbox wrangler login --device          # device flow; no callback server at all
+arbox wrangler login --browser false   # prints the URL, keeps the callback alive
+```
+
+`--browser false` works because arbox runs with `--network host`, so the
+callback server the container opens on `localhost:8976` is reachable from your
+host browser. On Windows and macOS that requires Docker Desktop's opt-in
+host-networking feature; `--device` avoids the question entirely.
+
+Unauthenticated wrangler still sends telemetry on every command. Set
+`WRANGLER_SEND_METRICS=false`, or `send_metrics = false` in the config, to turn
+that off.
 
 ## Windows Quirks
 
@@ -437,16 +595,19 @@ Files created inside the container will appear to be owned by UID/GID 1000 in th
    download. Only that layer's hard prerequisites precede it: an apt layer
    holding the browsers' shared libraries and fonts, then pinned Node. The
    main apt set (build tools, database clients, serial and audio userspace,
-   agent ergonomics) and the pinned uv, deno, bun, pnpm, and wrangler installs
-   all come after
-   (architecture chosen from BuildKit's `TARGETARCH`), so adding a package or
-   bumping a tool leaves the browsers cached. Below that it bakes in the
-   coding agents, mirrors the host user/group, and orders `PATH` so
-   `/usr/local/bin` (the baked agents) wins over the host-mounted
-   `~/.local/bin` — while `~/.cargo/bin` stays first for the rustup shims.
+   agent ergonomics) and the pinned uv, deno, bun, pnpm, and wrangler
+   installs all come after (architecture chosen from BuildKit's
+   `TARGETARCH`), so adding a package or bumping a tool leaves the browsers
+   cached. Below that it bakes in the coding agents, mirrors the host
+   user/group, and orders `PATH` so `/usr/local/bin` (the baked agents) wins
+   over the host-mounted `~/.local/bin` — while `~/.cargo/bin` stays first
+   for the rustup shims.
 5. `launch::mount_specs()` builds the explicit bind-mount list for the
-   workspace, git worktree metadata, Rust toolchain, and agent state dirs
-   (config, credentials, history, sessions). Agent *binaries* are never
+   workspace, git worktree metadata, Rust toolchain, wrangler's config dir
+   and the state dirs `launch::select()` resolved for this verb — an agent
+   verb's own agent, wrangler's config dir for `arbox wrangler`, nothing for
+   `bash`/`run`/`playwright` — adjusted by any `--mount-<name>` /
+   `--no-mount-<name>` flags. Agent *binaries* are never
    mounted — they come from the image. With `--profile NAME` each agent's state
    tree is instead sourced from `~/.arbox/profiles/NAME/` (see
    [Auth profiles](#auth-profiles---profile)). User-supplied `--rw`/`--ro`
