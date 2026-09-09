@@ -300,7 +300,16 @@ RUN install -d -o ${HOST_UID} -g ${HOST_GID} \
 # stays first so the host's rustup shims win (no agent collides with those).
 # Windows/macOS: /usr/local/cargo/bin is used (set via CARGO_HOME above, see
 # BAKE_RUSTUP). Linux: host's ${HOST_HOME}/.cargo/bin is mounted and used.
-ENV PATH=/usr/local/cargo/bin:/root/.cargo/bin:${HOST_HOME}/.cargo/bin:/usr/local/bin:${HOST_HOME}/.local/bin:/usr/bin:/bin
+#
+# /root/.cargo/bin is deliberately absent, and must not be re-added. Nothing
+# ever installs there — image::build_with_args always passes an explicit
+# CARGO_HOME (/usr/local/cargo when baking, ${HOST_HOME}/.cargo otherwise),
+# both of which are already listed — while /root stays mode 0700 and the
+# container runs as the host uid. An unreadable directory on PATH is not
+# inert: POSIX execvp records EACCES when it can't traverse a PATH element
+# and reports that instead of ENOENT once the search comes up empty, so any
+# missing command surfaces as a permission error rather than "not found".
+ENV PATH=/usr/local/cargo/bin:${HOST_HOME}/.cargo/bin:/usr/local/bin:${HOST_HOME}/.local/bin:/usr/bin:/bin
 
 # Marker so the host-side `arbox` binary refuses to run inside its own
 # container (where there's no `docker` to talk to anyway).
