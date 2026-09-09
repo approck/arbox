@@ -166,9 +166,9 @@ arbox grok                         # xAI Grok Build CLI
 ```
 
 The first build can take a few minutes because the image installs common
-development packages plus uv, deno, Node 22, Playwright with chromium +
-firefox baked in (~700 MB just for the browsers), and all five coding
-agents (claude, codex, opencode, agy, grok). Subsequent launches reuse the per-host
+development packages plus uv, deno, Node 22, bun, pnpm, wrangler, Playwright
+with chromium + firefox baked in (~700 MB just for the browsers), and all five
+coding agents (claude, codex, opencode, agy, grok). Subsequent launches reuse the per-host
 image tag, which is `arbox:<ubuntu-codename>-uid<uid>-<dockerfile-hash>`.
 The Dockerfile-content hash is the trailing 8 hex chars; editing the
 embedded Dockerfile changes the hash, which makes the next launch verb
@@ -437,7 +437,8 @@ Files created inside the container will appear to be owned by UID/GID 1000 in th
    download. Only that layer's hard prerequisites precede it: an apt layer
    holding the browsers' shared libraries and fonts, then pinned Node. The
    main apt set (build tools, database clients, serial and audio userspace,
-   agent ergonomics) and the pinned uv and deno installs all come after
+   agent ergonomics) and the pinned uv, deno, bun, pnpm, and wrangler installs
+   all come after
    (architecture chosen from BuildKit's `TARGETARCH`), so adding a package or
    bumping a tool leaves the browsers cached. Below that it bakes in the
    coding agents, mirrors the host user/group, and orders `PATH` so

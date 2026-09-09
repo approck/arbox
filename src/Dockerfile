@@ -195,6 +195,47 @@ RUN if [ "${BAKE_RUSTUP}" = "true" ]; then \
       chmod -R 777 "${CARGO_HOME}" "${RUSTUP_HOME}"; \
     fi
 
+# JS/TS package managers and the Cloudflare Workers CLI. Deliberately placed
+# BELOW the Playwright + rustup layers so adding or bumping any of these never
+# invalidates the browser download or a baked toolchain, and ABOVE the agent
+# cache-bust barrier so they stay pinned instead of moving on every
+# `arbox update`.
+
+# bun (JS runtime + npm-compatible package manager, `bun install` / `bunx`).
+# Same versioned-release pattern as uv/deno. NOTE: the plain linux-x64 build
+# requires an AVX2-capable CPU; on older hardware swap the asset name for
+# `bun-linux-x64-baseline.zip`.
+ARG BUN_VERSION=1.4.2
+RUN ARCH=$(case "${TARGETARCH}" in \
+        amd64) echo linux-x64 ;; \
+        arm64) echo linux-aarch64 ;; \
+        *)     echo "" ;; \
+    esac) \
+ && [ -n "${ARCH}" ] || { echo "arbox: unsupported TARGETARCH=${TARGETARCH}" >&2; exit 1; } \
+ && curl -fsSL "https://github.com/oven-sh/bun/releases/download/bun-v${BUN_VERSION}/bun-${ARCH}.zip" \
+      -o /tmp/bun.zip \
+ && unzip -q /tmp/bun.zip -d /tmp \
+ && install -m 0755 "/tmp/bun-${ARCH}/bun" /usr/local/bin/bun \
+ && ln -s /usr/local/bin/bun /usr/local/bin/bunx \
+ && rm -rf /tmp/bun.zip "/tmp/bun-${ARCH}"
+
+# pnpm, for repos whose lockfile is pnpm-lock.yaml. Installed as a plain
+# global npm package rather than through corepack: corepack downloads the
+# real package manager on first use (a network fetch at runtime, into an
+# ephemeral container cache) and is no longer distributed with Node 25+.
+ARG PNPM_VERSION=12.3.4
+RUN npm install -g "pnpm@${PNPM_VERSION}"
+
+# wrangler (Cloudflare Workers CLI). `wrangler dev` binds 8787 (worker) and
+# 9229 (inspector), and `wrangler login` binds 8976 for its OAuth callback —
+# all reachable from the host browser because arbox runs with `--network
+# host` (on Windows/macOS that needs Docker Desktop's opt-in host networking).
+#
+# Note that the image has no browser and no xdg-open, so an interactive login
+# in here wants `wrangler login --device` (or `--browser false`).
+ARG WRANGLER_VERSION=4.130.0
+RUN npm install -g "wrangler@${WRANGLER_VERSION}"
+
 # Cache-bust barrier for the five agent layers below. `arbox update` passes a
 # fresh value here (a unix timestamp) as a --build-arg, which invalidates this
 # layer and therefore every layer after it — the claude/codex/opencode/agy/grok
