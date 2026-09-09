@@ -16,13 +16,70 @@ ARG HOST_USER
 ARG HOST_HOME
 
 # BuildKit auto-injects TARGETARCH (e.g. amd64, arm64). We re-declare it so
-# subsequent RUN steps can reference it. Used to fetch the right uv/deno
-# release tarball for the host architecture.
+# subsequent RUN steps can reference it. Used to fetch the right node/uv/deno/
+# bun release tarball for the host architecture.
 ARG TARGETARCH
 
 ENV DEBIAN_FRONTEND=noninteractive
 
-# Apt package set, grouped by purpose:
+# Apt, part 1 of 2: ONLY what the Playwright browser download below needs.
+# Everything else is a second apt layer underneath it, so adding a dev package
+# later re-runs that layer alone and leaves the ~700 MB of browsers cached.
+#   - ca-certificates + curl fetch the node tarball; xz-utils unpacks it.
+#   - The lib* set is Chromium's and Firefox's shared-library closure, and the
+#     fonts are what keep rendered pages (and emoji) from turning into boxes.
+#     These are launch-time requirements, not download-time ones, so they could
+#     technically live below — they're here so the whole browser story is one
+#     contiguous block, at the cost of a re-download if the list ever changes.
+#     It rarely does; new browser versions ship their own bundled libraries.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      ca-certificates curl xz-utils \
+      libnss3 libatk1.0-0 libatk-bridge2.0-0 libcups2 libxkbcommon0 \
+      libxcomposite1 libxdamage1 libxfixes3 libxrandr2 libgbm1 \
+      libpango-1.0-0 libcairo2 libasound2t64 libatspi2.0-0 libxshmfence1 \
+      fonts-liberation fonts-noto-color-emoji \
+    && rm -rf /var/lib/apt/lists/*
+
+# Node.js (LTS, pinned) — first of the downloaded toolchains, and ONLY because
+# Playwright's browser fetch below needs npm. Same versioned-tarball pattern as
+# uv/deno/bun further down: no `curl | sh` against a moving install script.
+# Override NODE_VERSION at build time to bump. 22.x is required — @openai/codex's
+# npm package rejects anything older.
+ARG NODE_VERSION=22.11.0
+RUN ARCH=$(case "${TARGETARCH}" in \
+        amd64) echo x64 ;; \
+        arm64) echo arm64 ;; \
+        *)     echo "" ;; \
+    esac) \
+ && [ -n "${ARCH}" ] || { echo "arbox: unsupported TARGETARCH=${TARGETARCH}" >&2; exit 1; } \
+ && curl -fsSL "https://nodejs.org/dist/v${NODE_VERSION}/node-v${NODE_VERSION}-linux-${ARCH}.tar.xz" \
+      -o /tmp/node.tar.xz \
+ && tar -xJf /tmp/node.tar.xz -C /usr/local --strip-components=1 \
+ && rm -f /tmp/node.tar.xz
+
+# Playwright (pinned) plus its bundled Chromium and Firefox baked into the
+# image at /opt/ms-playwright. WebKit deliberately skipped — its system
+# library list is larger and changes more often. Override PLAYWRIGHT_VERSION
+# at build time to bump.
+#
+# This is the single most expensive layer in the image (~700 MB of browser
+# downloads), so it sits as HIGH in the file as its dependencies allow: only
+# the browser-prerequisite apt layer and node (which supplies the npm that
+# fetches them) may precede it. Everything else — the main apt set, uv, deno,
+# bun, pnpm, wrangler, rustup, the agents — goes BELOW, so bumping or adding
+# any of them leaves the browsers cached. Nothing new should be inserted above
+# this point without a hard dependency reason.
+ARG PLAYWRIGHT_VERSION=1.49.0
+ENV PLAYWRIGHT_BROWSERS_PATH=/opt/ms-playwright
+RUN npm install -g \
+      "playwright@${PLAYWRIGHT_VERSION}" \
+      "@playwright/test@${PLAYWRIGHT_VERSION}" \
+ && playwright install chromium firefox \
+ && chmod -R a+rX /opt/ms-playwright
+
+# Apt, part 2 of 2: everything that isn't a browser prerequisite, grouped by
+# purpose. This is the layer that churns, which is exactly why it lives below
+# the browser download.
 #   - C/C++ build drivers + linkers: build-essential pkg-config clang
 #     libclang-dev cmake mold (clang+libclang-dev are required by bindgen-
 #     based crates; cmake/mold cover *-sys crates and faster linking).
@@ -45,6 +102,7 @@ ENV DEBIAN_FRONTEND=noninteractive
 #     for the ALSA -> PulseAudio bridge so ALSA-only callers still reach the
 #     host's sound server. The devices and socket themselves are NOT in the
 #     image — they come in at runtime, only under `arbox --voice`.
+#   - unzip is what the deno and bun installs below unpack their releases with.
 #   - The rest are agent ergonomics: shells, search tools, network tools,
 #     wayland-clipboard for image paste, python + uv (later) for PEP-723
 #     scripts.
@@ -55,17 +113,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
       postgresql-client redis-tools default-mysql-client \
       gdb \
       libudev-dev dfu-util picocom \
-      ca-certificates curl git git-lfs \
-      vim nano less sudo jq unzip zip xz-utils \
+      git git-lfs \
+      vim nano less sudo jq unzip zip \
       ripgrep fd-find bat tree tmux shellcheck \
       dnsutils iputils-ping \
       wl-clipboard \
       sox libsox-fmt-all alsa-utils pulseaudio-utils libasound2-plugins \
       python3 python3-venv python3-pip \
-      libnss3 libatk1.0-0 libatk-bridge2.0-0 libcups2 libxkbcommon0 \
-      libxcomposite1 libxdamage1 libxfixes3 libxrandr2 libgbm1 \
-      libpango-1.0-0 libcairo2 libasound2t64 libatspi2.0-0 libxshmfence1 \
-      fonts-liberation fonts-noto-color-emoji \
     && rm -rf /var/lib/apt/lists/*
 
 # Debian/Ubuntu rename `fd` -> `fdfind` and `bat` -> `batcat` to avoid name
@@ -112,7 +166,7 @@ RUN ARCH=$(case "${TARGETARCH}" in \
 
 # deno (JS/TS runtime + script runner). Same pattern: versioned binary from
 # GitHub releases. Override DENO_VERSION at build time to bump.
-ARG DENO_VERSION=2.1.6
+ARG DENO_VERSION=2.9.6
 RUN ARCH=$(case "${TARGETARCH}" in \
         amd64) echo x86_64-unknown-linux-gnu ;; \
         arm64) echo aarch64-unknown-linux-gnu ;; \
@@ -125,38 +179,11 @@ RUN ARCH=$(case "${TARGETARCH}" in \
  && install -m 0755 /tmp/deno /usr/local/bin/deno \
  && rm -f /tmp/deno.zip /tmp/deno
 
-# Node.js (LTS, pinned). Mirrors the uv/deno pattern: versioned tarball
-# from the canonical distribution, no `curl | sh` against a moving install
-# script. Override NODE_VERSION at build time to bump. 22.x is required —
-# @openai/codex's npm package rejects anything older.
-ARG NODE_VERSION=22.11.0
-RUN ARCH=$(case "${TARGETARCH}" in \
-        amd64) echo x64 ;; \
-        arm64) echo arm64 ;; \
-        *)     echo "" ;; \
-    esac) \
- && [ -n "${ARCH}" ] || { echo "arbox: unsupported TARGETARCH=${TARGETARCH}" >&2; exit 1; } \
- && curl -fsSL "https://nodejs.org/dist/v${NODE_VERSION}/node-v${NODE_VERSION}-linux-${ARCH}.tar.xz" \
-      -o /tmp/node.tar.xz \
- && tar -xJf /tmp/node.tar.xz -C /usr/local --strip-components=1 \
- && rm -f /tmp/node.tar.xz
-
-# Playwright (pinned) plus its bundled Chromium and Firefox baked into the
-# image at /opt/ms-playwright. WebKit deliberately skipped — its system
-# library list is larger and changes more often. Override PLAYWRIGHT_VERSION
-# at build time to bump.
-ARG PLAYWRIGHT_VERSION=1.49.0
-ENV PLAYWRIGHT_BROWSERS_PATH=/opt/ms-playwright
-RUN npm install -g \
-      "playwright@${PLAYWRIGHT_VERSION}" \
-      "@playwright/test@${PLAYWRIGHT_VERSION}" \
- && playwright install chromium firefox \
- && chmod -R a+rX /opt/ms-playwright
-
 # Rust toolchain: baked into the image for Windows/macOS hosts (BAKE_RUSTUP),
 # or mounted from the host for native Linux hosts, where this RUN is a cheap
 # no-op. Lives ABOVE the agent cache-bust barrier because the toolchain
-# download is expensive and must stay cached across `arbox update` runs.
+# download is expensive and must stay cached across `arbox update` runs — but
+# BELOW Playwright, so bumping the toolchain never re-fetches the browsers.
 ARG WINDOWS_HOST=false
 ARG BAKE_RUSTUP=false
 ARG CARGO_HOME=/root/.cargo
@@ -172,9 +199,9 @@ RUN if [ "${BAKE_RUSTUP}" = "true" ]; then \
 # fresh value here (a unix timestamp) as a --build-arg, which invalidates this
 # layer and therefore every layer after it — the claude/codex/opencode/agy/grok
 # installs re-run and pull their latest published versions, while every
-# expensive layer ABOVE this point (apt, uv, deno, node, the ~700 MB
-# Playwright browser downloads, the baked rustup toolchain on Windows/macOS)
-# stays cached. The default 0 keeps ordinary cached builds (the auto-bootstrap on
+# expensive layer ABOVE this point (apt, node, the ~700 MB Playwright browser
+# downloads, uv, deno, bun/pnpm/wrangler, the baked rustup toolchain on
+# Windows/macOS) stays cached. The default 0 keeps ordinary cached builds (the auto-bootstrap on
 # first launch, `arbox update --force`'s --no-cache pass) unaffected: the
 # agents only move when you run `arbox update`. This barrier MUST stay below
 # the last expensive layer and above the first agent install.

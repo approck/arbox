@@ -432,12 +432,17 @@ Files created inside the container will appear to be owned by UID/GID 1000 in th
    (`arbox:<codename>-uid<uid>-<hash>`). When the Dockerfile changes, the tag
    changes, so missing-image detection automatically triggers a rebuild on
    the next launch.
-4. The Dockerfile starts from `ubuntu:<host-codename>`, installs common
-   development tools plus pinned uv and deno binaries (architecture chosen
-   from BuildKit's `TARGETARCH`), bakes in the coding agents, mirrors the
-   host user/group, and orders `PATH` so `/usr/local/bin` (the baked agents)
-   wins over the host-mounted `~/.local/bin` — while `~/.cargo/bin` stays
-   first for the rustup shims.
+4. The Dockerfile starts from `ubuntu:<host-codename>` and is ordered around
+   its one genuinely expensive layer, the ~700 MB Playwright browser
+   download. Only that layer's hard prerequisites precede it: an apt layer
+   holding the browsers' shared libraries and fonts, then pinned Node. The
+   main apt set (build tools, database clients, serial and audio userspace,
+   agent ergonomics) and the pinned uv and deno installs all come after
+   (architecture chosen from BuildKit's `TARGETARCH`), so adding a package or
+   bumping a tool leaves the browsers cached. Below that it bakes in the
+   coding agents, mirrors the host user/group, and orders `PATH` so
+   `/usr/local/bin` (the baked agents) wins over the host-mounted
+   `~/.local/bin` — while `~/.cargo/bin` stays first for the rustup shims.
 5. `launch::mount_specs()` builds the explicit bind-mount list for the
    workspace, git worktree metadata, Rust toolchain, and agent state dirs
    (config, credentials, history, sessions). Agent *binaries* are never
