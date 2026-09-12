@@ -45,7 +45,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # uv/deno/bun further down: no `curl | sh` against a moving install script.
 # Override NODE_VERSION at build time to bump. 22.x is required — @openai/codex's
 # npm package rejects anything older.
-ARG NODE_VERSION=22.11.0
+ARG NODE_VERSION=22.23.2
 RUN ARCH=$(case "${TARGETARCH}" in \
         amd64) echo x64 ;; \
         arm64) echo arm64 ;; \
@@ -69,7 +69,7 @@ RUN ARCH=$(case "${TARGETARCH}" in \
 # bun, pnpm, wrangler, rustup, the agents — goes BELOW, so bumping or adding
 # any of them leaves the browsers cached. Nothing new should be inserted above
 # this point without a hard dependency reason.
-ARG PLAYWRIGHT_VERSION=1.49.0
+ARG PLAYWRIGHT_VERSION=1.63.0
 ENV PLAYWRIGHT_BROWSERS_PATH=/opt/ms-playwright
 RUN npm install -g \
       "playwright@${PLAYWRIGHT_VERSION}" \
@@ -176,7 +176,7 @@ RUN install -d /etc/alsa/conf.d \
 # uv (Python package + project manager). Versioned tarball direct from
 # GitHub releases — no `curl | sh` against a moving install script. Override
 # UV_VERSION at build time to bump. Pinned checksum is a known TODO.
-ARG UV_VERSION=0.5.13
+ARG UV_VERSION=0.12.13
 RUN ARCH=$(case "${TARGETARCH}" in \
         amd64) echo x86_64-unknown-linux-gnu ;; \
         arm64) echo aarch64-unknown-linux-gnu ;; \
@@ -249,7 +249,7 @@ RUN ARCH=$(case "${TARGETARCH}" in \
 # global npm package rather than through corepack: corepack downloads the
 # real package manager on first use (a network fetch at runtime, into an
 # ephemeral container cache) and is no longer distributed with Node 25+.
-ARG PNPM_VERSION=12.3.4
+ARG PNPM_VERSION=12.4.1
 RUN npm install -g "pnpm@${PNPM_VERSION}"
 
 # wrangler (Cloudflare Workers CLI). `wrangler dev` binds 8787 (worker) and
@@ -266,7 +266,7 @@ RUN npm install -g "pnpm@${PNPM_VERSION}"
 # Note also that the image has no browser and no xdg-open, so an interactive
 # login in here wants `wrangler login --device` (or `--browser false`).
 # (the Wayland socket puts a display in reach, but still no browser binary.)
-ARG WRANGLER_VERSION=4.130.0
+ARG WRANGLER_VERSION=4.131.1
 RUN npm install -g "wrangler@${WRANGLER_VERSION}"
 
 # gh (GitHub CLI). Versioned tarball from GitHub releases, same pattern as
