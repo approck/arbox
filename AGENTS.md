@@ -124,6 +124,40 @@ Do NOT start with grep searches. The README is the documentation index.
 - Add tests for any change that expands the mount model, adds docker flags, or materially changes image tags. The docker argument list is the contract: assert it exactly, as the `serial_apply_*` and audio tests do.
 - Don't add tests that require a live Docker daemon.
 
+## Pinned tool versions
+
+Everything downloaded into the image is pinned by an `ARG <NAME>_VERSION=` line in `src/Dockerfile`. The pins are the upgrade surface; nothing in the image is meant to float except the five coding agents, which stay at `latest` on purpose and move only via `arbox update`.
+
+| Pin | What it is | Where the latest version is published |
+|---|---|---|
+| `NODE_VERSION` | Node.js LTS. Must stay at a version `@openai/codex` accepts (22.x or newer). | https://nodejs.org/dist/index.json |
+| `PLAYWRIGHT_VERSION` | Playwright plus its bundled Chromium and Firefox. Bumping it re-downloads the ~700 MB browser layer. | https://registry.npmjs.org/playwright/latest |
+| `UV_VERSION` | uv, from GitHub releases. | https://api.github.com/repos/astral-sh/uv/releases/latest |
+| `DENO_VERSION` | deno, from GitHub releases. | https://api.github.com/repos/denoland/deno/releases/latest |
+| `BUN_VERSION` | bun, from GitHub releases. | https://api.github.com/repos/oven-sh/bun/releases/latest |
+| `PNPM_VERSION` | pnpm, via npm. | https://registry.npmjs.org/pnpm/latest |
+| `WRANGLER_VERSION` | Cloudflare Workers CLI, via npm. | https://registry.npmjs.org/wrangler/latest |
+| `GH_VERSION` | GitHub CLI, from GitHub releases. | https://api.github.com/repos/cli/cli/releases/latest |
+
+Rules for re-pinning:
+
+- Look the current version up at the URL in the table. Never guess a version number from memory, and never pin a pre-release.
+- Confirm the exact download asset exists before pinning (a HEAD request on the tarball URL the Dockerfile builds), since asset naming schemes change between releases.
+- Bump one pin per commit unless the developer asks for a sweep. A sweep is one commit, with one bullet per pin naming old and new versions.
+- Keep the Dockerfile layer order: pins stay below the Playwright browser layer and above the `AGENT_REFRESH` cache-bust barrier, so a bump never re-downloads browsers and never makes the agents float.
+- The agents (`CLAUDE_CODE_VERSION`, `CODEX_VERSION`, `OPENCODE_VERSION`, agy, grok) are not pins. Do not pin them to a number.
+- Any pin bump changes the embedded Dockerfile hash, so the next launch rebuilds the image. Say so in the report.
+
+## Releases
+
+A release is a commit titled `release: X.Y.Z` that bumps `version` in `Cargo.toml` and the matching line in `Cargo.lock`, with a body of `Changes since X.Y.W:` followed by one bullet per user-visible change, and a `Note for existing scripts:` paragraph when a default changed. Nothing else goes in that commit.
+
+When the developer asks to cut a release:
+
+1. Before drafting anything, check every pin in the table above against its published latest version and report which are behind, with old and new numbers.
+2. Offer to re-pin the stale ones as a separate commit ahead of the release commit. Do not bump them silently, and do not fold them into the release commit.
+3. Draft the release commit from `git log <last release>..HEAD`, then wait for approval as with any commit.
+
 ## Commit messages
 
 - Imperative mood, ~70 chars or less for the subject.
