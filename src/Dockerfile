@@ -102,6 +102,26 @@ RUN npm install -g \
 #     for the ALSA -> PulseAudio bridge so ALSA-only callers still reach the
 #     host's sound server. The devices and socket themselves are NOT in the
 #     image — they come in at runtime, only under `arbox --voice`.
+#   - GUI userspace, for Wayland windows (the host socket is mounted by
+#     default; `--no-mount-wayland` withholds it):
+#     libwayland-cursor0 + libwayland-egl1 complete the winit runtime closure
+#     (libwayland-client0 and libxkbcommon0 are already here via wl-clipboard
+#     and Chromium); libdecor-0-0 draws SDL2/pygame title bars on GNOME, which
+#     has no server-side decorations; libegl1 + libgles2 + libgl1 +
+#     libgl1-mesa-dri are the GL path (eframe's glow backend, Slint) and carry
+#     llvmpipe; libvulkan1 + mesa-vulkan-drivers are the Vulkan path (wgpu,
+#     iced, Bevy) and carry lavapipe — so windows render with NO GPU
+#     passthrough, and `--gpu` is a speed-up, not a prerequisite;
+#     fontconfig because winit draws its own title bar text on GNOME;
+#     adwaita-icon-theme supplies the pointer cursor (invisible without a
+#     theme); libdbus-1-3 because Qt (PySide6/PyQt6 wheels) links it even on
+#     Wayland; libgtk-4-dev + libadwaita-1-dev so gtk-rs / relm4 / PyGObject
+#     projects build; mesa-utils + vulkan-tools (eglinfo, vulkaninfo) to see
+#     whether an app got hardware or software rendering. The compositor
+#     socket and /dev/dri are NOT in the image — they come in at runtime,
+#     the socket by default (`--no-mount-wayland` withholds), the render
+#     nodes only under `--gpu`. No X11 server libs: the X11
+#     socket is never mounted.
 #   - unzip is what the deno and bun installs below unpack their releases with.
 #   - The rest are agent ergonomics: shells, search tools, network tools,
 #     wayland-clipboard for image paste, python + uv (later) for PEP-723
@@ -119,6 +139,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
       dnsutils iputils-ping \
       wl-clipboard \
       sox libsox-fmt-all alsa-utils pulseaudio-utils libasound2-plugins \
+      libwayland-cursor0 libwayland-egl1 libdecor-0-0 \
+      libegl1 libgles2 libgl1 libgl1-mesa-dri \
+      libvulkan1 mesa-vulkan-drivers \
+      fontconfig adwaita-icon-theme libdbus-1-3 \
+      libgtk-4-dev libadwaita-1-dev \
+      mesa-utils vulkan-tools \
       python3 python3-venv python3-pip \
     && rm -rf /var/lib/apt/lists/*
 
@@ -239,6 +265,7 @@ RUN npm install -g "pnpm@${PNPM_VERSION}"
 # so Workers are developed and tested without a deploy-capable token at all.
 # Note also that the image has no browser and no xdg-open, so an interactive
 # login in here wants `wrangler login --device` (or `--browser false`).
+# (the Wayland socket puts a display in reach, but still no browser binary.)
 ARG WRANGLER_VERSION=4.130.0
 RUN npm install -g "wrangler@${WRANGLER_VERSION}"
 

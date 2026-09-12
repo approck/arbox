@@ -64,6 +64,20 @@ struct Cli {
     #[arg(long = "serial-dev", value_name = "DEV")]
     serial_dev: Vec<PathBuf>,
 
+    /// Bind the host's Wayland display socket into the container,
+    /// so processes inside can open windows on your desktop and read the
+    /// clipboard (claude's image paste). This is the DEFAULT whenever the
+    /// host has a Wayland session; spelling it out makes a missing session a
+    /// hard error instead of a silent skip. Wayland only — the X11 socket is
+    /// never mounted. Linux only.
+    #[arg(long = "mount-wayland")]
+    mount_wayland: bool,
+
+    /// Leave the host's Wayland socket unmounted: no windows, no
+    /// clipboard, no display of any kind inside the container.
+    #[arg(long = "no-mount-wayland", conflicts_with = "mount_wayland")]
+    no_mount_wayland: bool,
+
     // Per-agent state mounts. Each agent verb mounts its OWN state and
     // nothing else; every other verb (bash, run, playwright) mounts none. So
     // `arbox codex` cannot read your Claude credentials or session history,
@@ -337,6 +351,11 @@ fn main() -> ExitCode {
         profile: cli.profile,
         voice: cli.voice,
         serial,
+        wayland: match (cli.mount_wayland, cli.no_mount_wayland) {
+            (true, _) => Some(true),
+            (_, true) => Some(false),
+            _ => None,
+        },
         mounts,
     };
     match dispatch(cli.cmd, opts) {

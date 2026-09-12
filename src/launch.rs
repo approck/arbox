@@ -633,7 +633,8 @@ pub fn tool_summaries(host: &HostContext, sel: &Selection) -> Vec<(&'static str,
 
 /// Per-invocation launch options shared by every verb: the user's extra
 /// bind-mount paths, the optional `--profile` name, the per-tool mount
-/// overrides, and the `--voice` / `--serial` opt-ins.
+/// overrides, the `--voice` / `--serial` opt-ins, and the
+/// `--mount-wayland` / `--no-mount-wayland` override of the display default.
 /// Bundled so adding a cross-cutting knob doesn't ripple through every verb
 /// function's signature.
 #[derive(Default)]
@@ -649,6 +650,12 @@ pub struct Opts {
     /// Bind USB serial devices into the container (`--serial` /
     /// `--serial-dev`). `None` binds nothing.
     pub serial: Option<SerialRequest>,
+    /// Whether to bind the host's Wayland display socket into the container,
+    /// so processes inside can open windows and read the clipboard. `None`
+    /// is the default: bind it when the host has one, silently skip
+    /// otherwise. `Some(true)` (`--mount-wayland`) makes a missing session a
+    /// hard error; `Some(false)` (`--no-mount-wayland`) never binds it.
+    pub wayland: Option<bool>,
 }
 
 /// Which USB serial devices `--serial` should bind. Auto-detection binds
@@ -852,6 +859,11 @@ fn run(host: HostContext, argv: Vec<String>, opts: Opts, sel: &Selection) -> Res
     // rather than after a multi-minute bootstrap.
     let audio = opts.voice.then(|| require_audio(&host)).transpose()?;
     let serial = opts.serial.as_ref().map(require_serial).transpose()?;
+    let wayland = match opts.wayland {
+        Some(true) => Some(require_wayland(&host)?),
+        Some(false) => None,
+        None => Some(detect_wayland(&host)).filter(|w| !w.is_empty()),
+    };
     if let Some(serial) = &serial {
         // stderr, so `arbox run -- foo | bar` pipelines stay clean.
         eprintln!("arbox: {}", serial.launch_note());
@@ -918,7 +930,9 @@ fn run(host: HostContext, argv: Vec<String>, opts: Opts, sel: &Selection) -> Res
         cmd.arg("--mount").arg(arg);
     }
 
-    add_wayland_clipboard(&mut cmd);
+    if let Some(wayland) = &wayland {
+        wayland.apply(&mut cmd, host.uid, host.gid);
+    }
     if let Some(audio) = &audio {
         audio.apply(&mut cmd);
     }
@@ -957,36 +971,118 @@ fn run(host: HostContext, argv: Vec<String>, opts: Opts, sel: &Selection) -> Res
     })
 }
 
-/// Expose the host's Wayland display socket so claude's image-paste flow
-/// (`wl-paste --type image/png`) can read the clipboard. Wayland-only: we
-/// don't mount the X11 socket. No-op when there's no Wayland session on the
-/// host (e.g. headless server, X11-only desktop).
+/// The host display plumbing handed to the container: the compositor's
+/// socket, which is everything a Wayland client needs to open windows and
+/// read the clipboard (claude's image-paste flow runs `wl-paste --type
+/// image/png` over it). Bound by DEFAULT whenever the host has a Wayland
+/// session — image paste and GUI work are everyday needs — and withheld with
+/// `--no-mount-wayland`; `--mount-wayland` spells the default out and makes
+/// a missing session a hard error. Wayland-only — the X11 socket is never
+/// mounted, because X11 has no client isolation (any X client can read every
+/// other window's input and pixels), whereas a Wayland client sees only its
+/// own surfaces, which is what makes a default-on display tolerable.
 ///
 /// Mounts JUST the socket file — not `$XDG_RUNTIME_DIR` — so the rest of the
-/// runtime dir (D-Bus session bus, gnome-keyring control socket, etc.) stays
-/// on the host. We set `WAYLAND_DISPLAY` to the absolute socket path so
+/// host runtime dir (D-Bus session bus, gnome-keyring control socket, …) stays
+/// on the host. `WAYLAND_DISPLAY` is set to the absolute socket path so
 /// libwayland connects directly without resolving against `XDG_RUNTIME_DIR`.
-fn add_wayland_clipboard(cmd: &mut Command) {
-    let Ok(wd) = std::env::var("WAYLAND_DISPLAY") else {
-        return;
-    };
-    let socket: PathBuf = if Path::new(&wd).is_absolute() {
-        PathBuf::from(&wd)
-    } else {
-        let Some(rd) = std::env::var_os("XDG_RUNTIME_DIR") else {
+/// The container gets its own private tmpfs as `XDG_RUNTIME_DIR` instead:
+/// GTK, Qt and SDL insist on a writable, user-owned, mode-0700 runtime dir
+/// (for their own sockets and shm files), and without one they warn or fail
+/// to start. winit-based apps (egui, iced, wgpu, Bevy, Slint) need neither.
+pub struct WaylandAccess {
+    /// The compositor socket on the host, bind-mounted at the same path.
+    socket: Option<PathBuf>,
+}
+
+/// Container-side `XDG_RUNTIME_DIR` when the Wayland socket is bound. Not
+/// `/run/user/<uid>`: that is where the host socket usually lives, and the
+/// socket's bind mount must not be stacked on top of a tmpfs at its own
+/// parent.
+const CONTAINER_RUNTIME_DIR: &str = "/run/arbox-runtime";
+
+impl WaylandAccess {
+    fn is_empty(&self) -> bool {
+        self.socket.is_none()
+    }
+
+    /// Append the docker flags that carry this access into the container.
+    /// `uid`/`gid` own the runtime tmpfs, matching `--user`.
+    fn apply(&self, cmd: &mut Command, uid: u32, gid: u32) {
+        let Some(sock) = self.socket.as_ref().and_then(|p| p.to_str()) else {
             return;
         };
-        PathBuf::from(rd).join(&wd)
-    };
-    if !socket.exists() {
-        return;
+        cmd.arg("--mount")
+            .arg(format!("type=bind,src={sock},dst={sock}"));
+        cmd.arg("-e").arg(format!("WAYLAND_DISPLAY={sock}"));
+        cmd.arg("--tmpfs").arg(format!(
+            "{CONTAINER_RUNTIME_DIR}:rw,nosuid,nodev,mode=0700,uid={uid},gid={gid}"
+        ));
+        cmd.arg("-e")
+            .arg(format!("XDG_RUNTIME_DIR={CONTAINER_RUNTIME_DIR}"));
     }
-    let Some(socket_str) = socket.to_str() else {
-        return;
-    };
-    cmd.arg("--mount")
-        .arg(format!("type=bind,src={socket_str},dst={socket_str}"));
-    cmd.arg("-e").arg(format!("WAYLAND_DISPLAY={socket_str}"));
+
+    /// One-line description for `arbox status`.
+    pub fn summary(&self) -> String {
+        match &self.socket {
+            Some(s) => format!(
+                "socket {} (bound by default; --no-mount-wayland to withhold)",
+                s.display()
+            ),
+            None => "no Wayland session detected on host".to_string(),
+        }
+    }
+}
+
+/// Where the host's Wayland socket is, per the protocol's own rules: an
+/// absolute `$WAYLAND_DISPLAY` is the socket path itself, a relative one
+/// resolves against `$XDG_RUNTIME_DIR`. `None` when either is missing —
+/// a headless host or an X11-only desktop.
+fn wayland_socket_path(get: &dyn Fn(&str) -> Option<std::ffi::OsString>) -> Option<PathBuf> {
+    let wd = PathBuf::from(get("WAYLAND_DISPLAY")?);
+    if wd.is_absolute() {
+        return Some(wd);
+    }
+    Some(PathBuf::from(get("XDG_RUNTIME_DIR")?).join(wd))
+}
+
+/// What display the host currently offers. Pure detection — no error when
+/// there's nothing, since `arbox status` reports the empty case too.
+///
+/// Linux-only by construction: Docker Desktop's Linux VM on Windows and
+/// macOS has no path to a host compositor (neither host runs one), so
+/// detection reports empty there rather than promising a socket
+/// `--mount-wayland` then can't bind.
+pub fn detect_wayland(_host: &HostContext) -> WaylandAccess {
+    if !cfg!(target_os = "linux") {
+        return WaylandAccess { socket: None };
+    }
+    let socket = wayland_socket_path(&|var| std::env::var_os(var)).filter(|p| p.exists());
+    WaylandAccess { socket }
+}
+
+/// `detect_wayland`, but for the explicit `--mount-wayland` path where
+/// finding nothing is a hard error — the user asked for a display by name,
+/// so silently launching without one would just move the failure to the
+/// first window. (The default path skips silently instead: a headless host
+/// must still be able to run `arbox claude`.)
+fn require_wayland(host: &HostContext) -> Result<WaylandAccess> {
+    let wayland = detect_wayland(host);
+    if wayland.is_empty() {
+        if cfg!(target_os = "linux") {
+            bail!(
+                "--mount-wayland: no Wayland socket found — expected $WAYLAND_DISPLAY to name \
+                 one (relative to $XDG_RUNTIME_DIR, or absolute). A headless host, an ssh \
+                 session, or an X11-only desktop will all look like this; the X11 socket is \
+                 deliberately not supported."
+            );
+        }
+        bail!(
+            "--mount-wayland is Linux-only: Docker Desktop's Linux VM has no path to a host \
+             compositor on Windows or macOS"
+        );
+    }
+    Ok(wayland)
 }
 
 /// The host sound plumbing `--voice` hands to the container. Nothing here is
@@ -1784,6 +1880,90 @@ mod tests {
                 );
             }
         }
+    }
+
+    // Wayland socket resolution is env-driven and Linux-only; pin it on Unix
+    // (Path::is_absolute has Windows semantics).
+    #[cfg(not(target_family = "windows"))]
+    #[test]
+    fn wayland_socket_resolution() {
+        use std::ffi::OsString;
+
+        // No WAYLAND_DISPLAY → no session, whatever XDG_RUNTIME_DIR says.
+        let xdg_only =
+            |var: &str| (var == "XDG_RUNTIME_DIR").then(|| OsString::from("/run/user/1000"));
+        assert_eq!(wayland_socket_path(&xdg_only), None);
+
+        // Relative name resolves against the runtime dir …
+        let both = |var: &str| match var {
+            "WAYLAND_DISPLAY" => Some(OsString::from("wayland-0")),
+            "XDG_RUNTIME_DIR" => Some(OsString::from("/run/user/1000")),
+            _ => None,
+        };
+        assert_eq!(
+            wayland_socket_path(&both),
+            Some(PathBuf::from("/run/user/1000/wayland-0"))
+        );
+        // … and without one there is nothing to resolve against.
+        let rel_only = |var: &str| (var == "WAYLAND_DISPLAY").then(|| OsString::from("wayland-0"));
+        assert_eq!(wayland_socket_path(&rel_only), None);
+
+        // An absolute value is the socket itself; the runtime dir is ignored.
+        let abs = |var: &str| {
+            (var == "WAYLAND_DISPLAY").then(|| OsString::from("/run/user/1000/wayland-1"))
+        };
+        assert_eq!(
+            wayland_socket_path(&abs),
+            Some(PathBuf::from("/run/user/1000/wayland-1"))
+        );
+    }
+
+    /// The docker flags are the contract: the socket at its own path,
+    /// WAYLAND_DISPLAY absolute, and a private user-owned runtime tmpfs.
+    #[test]
+    fn wayland_apply_emits_socket_env_and_runtime_tmpfs() {
+        let access = WaylandAccess {
+            socket: Some(PathBuf::from("/run/user/1000/wayland-0")),
+        };
+        let mut cmd = Command::new("docker");
+        access.apply(&mut cmd, 1000, 1000);
+        let args: Vec<String> = cmd
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            args,
+            [
+                "--mount",
+                "type=bind,src=/run/user/1000/wayland-0,dst=/run/user/1000/wayland-0",
+                "-e",
+                "WAYLAND_DISPLAY=/run/user/1000/wayland-0",
+                "--tmpfs",
+                "/run/arbox-runtime:rw,nosuid,nodev,mode=0700,uid=1000,gid=1000",
+                "-e",
+                "XDG_RUNTIME_DIR=/run/arbox-runtime",
+            ]
+        );
+
+        // Nothing detected: nothing emitted, not even the runtime dir.
+        let none = WaylandAccess { socket: None };
+        let mut cmd = Command::new("docker");
+        none.apply(&mut cmd, 1000, 1000);
+        assert_eq!(cmd.get_args().count(), 0);
+        assert!(none.is_empty());
+    }
+
+    #[test]
+    fn wayland_summary_reports_empty_and_populated() {
+        let none = WaylandAccess { socket: None };
+        assert_eq!(none.summary(), "no Wayland session detected on host");
+        let some = WaylandAccess {
+            socket: Some(PathBuf::from("/run/user/1000/wayland-0")),
+        };
+        assert_eq!(
+            some.summary(),
+            "socket /run/user/1000/wayland-0 (bound by default; --no-mount-wayland to withhold)"
+        );
     }
 
     // Path::is_absolute has Windows semantics, and the whole audio path is

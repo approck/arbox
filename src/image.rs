@@ -319,5 +319,9 @@ pub fn print_status(profile: Option<&str>, mounts: &crate::launch::MountOverride
     println!("network: host");
     println!("audio:   {}", crate::launch::detect_audio(&host).summary());
     println!("serial:  {}", crate::launch::detect_serial().summary());
+    println!(
+        "wayland: {}",
+        crate::launch::detect_wayland(&host).summary()
+    );
     Ok(())
 }

@@ -76,9 +76,14 @@ or a process that you intentionally gave access to your mounted credentials.
   so this mount carries executables in both directions — a compromised
   container agent could tamper with binaries the host's own opencode later
   runs.
-- **The host Wayland display socket is mounted when available** so
-  `wl-paste` works for clipboard image flows. Only the socket file is
-  mounted, not the full `$XDG_RUNTIME_DIR`.
+- **The host Wayland display socket is mounted by default** when the host
+  has a Wayland session — enough for anything inside to open windows on your
+  desktop and to read the clipboard (which is what claude's image paste
+  uses). `--no-mount-wayland` withholds it. Only the socket file is mounted,
+  not the full `$XDG_RUNTIME_DIR`, and the X11 socket is never mounted: X11
+  has no client isolation, whereas a Wayland client sees only its own
+  windows, which is what makes a default-on display tolerable. See
+  [Wayland windows](#wayland-windows---mount-wayland).
 - **Audio is NOT bound unless you pass `--voice`.** With the flag, the
   container gets the host's PulseAudio/PipeWire socket and/or the ALSA
   devices under `/dev/snd` — that is a live microphone and speakers for
@@ -218,7 +223,7 @@ clear message.
 | `arbox [OPTIONS] run CMD...`    | Run a one-off command inside the container. No agent state is mounted. |
 | `arbox update`                  | Refresh the baked-in agents (claude, codex, opencode, agy, grok) to their latest published versions, rebuilding only the agent layers (quick — the apt/node/playwright layers stay cached). Builds the image from scratch if it doesn't exist yet. |
 | `arbox update --force`          | Full clean rebuild of the entire image (`--no-cache`): re-runs apt, node, the Playwright browser downloads, everything. |
-| `arbox status`                  | Show host facts, mount layout, image presence, network mode, whether the wrangler and gh config dirs are bound, and detected host audio and USB serial devices. Works outside a git repository (skips the workspace mount in that case). |
+| `arbox status`                  | Show host facts, mount layout, image presence, network mode, whether the wrangler and gh config dirs are bound, and detected host audio, USB serial devices, and Wayland socket. Works outside a git repository (skips the workspace mount in that case). |
 | `arbox clean`                   | Remove every arbox image whose tag has the current host's prefix. |
 
 **arbox options go before the verb. Everything after the verb belongs to the
@@ -445,6 +450,62 @@ The compiler side is host work, because `~/.rustup` is mounted read-only:
   gigabytes of SDK and a Python venv under `~/.espressif`, which is not one of
   arbox's persisted mounts. Add `--rw ~/.espressif` so that survives across
   launches. Bare-metal `no_std` projects on `esp-hal` avoid this entirely.
+
+### Wayland windows (`--mount-wayland`)
+
+When the host has a Wayland session, its compositor socket is bound into the
+container by default, so GUI programs inside open real windows on your
+desktop and claude's image paste (`wl-paste --type image/png`) works:
+
+```bash
+arbox run cargo run                      # an egui / iced / Bevy app opens a window
+arbox --no-mount-wayland claude          # no display, no clipboard in the box
+arbox --mount-wayland run cargo run      # same as the default, but a missing
+                                         # session is an error, not a skip
+```
+
+Two options control it on any launch verb: `--no-mount-wayland` withholds
+the socket, and `--mount-wayland` spells the default out — useful in scripts
+that must not silently run headless, since the bare default skips the mount
+when there is no session (a headless box still has to be able to run `arbox
+claude`).
+
+What gets bound:
+
+| Host thing                                          | How it's passed |
+|-----------------------------------------------------|-----------------|
+| Wayland socket (`$WAYLAND_DISPLAY`, resolved against `$XDG_RUNTIME_DIR` when relative) | Bind-mounted at the same path, with `WAYLAND_DISPLAY` set to that absolute path so libwayland connects to it directly. Only the socket file — the rest of the host runtime dir (D-Bus session bus, keyring socket) stays on the host. |
+| — | A private tmpfs at `/run/arbox-runtime`, owned by your uid and mode 0700, becomes the container's `XDG_RUNTIME_DIR`. GTK, Qt and SDL require one; winit apps don't care. |
+
+Wayland only. The X11 socket is never mounted. The reason is the isolation
+model: an X11 client can read every other window's keystrokes and pixels,
+while a Wayland client sees only its own surfaces — which is what makes
+handing an agent a display by default tolerable at all. The practical
+consequence is that X11-only toolkits (tkinter,
+OpenCV's `imshow`, an Electron or Chromium window without
+`--ozone-platform=wayland`) don't work in here; winit, GTK 4, Qt 6, SDL 2 and
+everything built on them do.
+
+The image ships the userspace side: the Wayland client libraries, Mesa's GL
+and Vulkan drivers **including their software rasterizers** (llvmpipe and
+lavapipe), fontconfig and a cursor theme, GTK 4 and libadwaita with their dev
+headers for gtk-rs builds, and `eglinfo` / `vulkaninfo` to check what an app
+will get. So a window works with no GPU passthrough at all.
+
+Two Rust-side gotchas worth knowing: Bevy's default features enable X11 only,
+so a Bevy project must turn on its `wayland` cargo feature or it will fail to
+find a display; and GNOME has no server-side decorations, so winit draws its
+own title bar (which is why fontconfig is in the image).
+
+`arbox status` reports what it can see:
+
+```
+wayland: socket /run/user/1000/wayland-0 (bound by default; --no-mount-wayland to withhold)
+```
+
+The mount is Linux-only. On Windows and macOS there is no host compositor for
+Docker Desktop's VM to reach, so the default silently binds nothing and
+`--mount-wayland` errors out immediately.
 
 ### Auth profiles (`--profile`)
 
@@ -684,9 +745,9 @@ Files created inside the container will appear to be owned by UID/GID 1000 in th
    its one genuinely expensive layer, the ~700 MB Playwright browser
    download. Only that layer's hard prerequisites precede it: an apt layer
    holding the browsers' shared libraries and fonts, then pinned Node. The
-   main apt set (build tools, database clients, serial and audio userspace,
-   agent ergonomics) and the pinned uv, deno, bun, pnpm, wrangler, and gh
-   installs all come after (architecture chosen from BuildKit's
+   main apt set (build tools, database clients, serial, audio and Wayland/
+   Mesa GUI userspace, agent ergonomics) and the pinned uv, deno, bun, pnpm,
+   wrangler, and gh installs all come after (architecture chosen from BuildKit's
    `TARGETARCH`), so adding a package or bumping a tool leaves the browsers
    cached. Below that it bakes in the coding agents, mirrors the host
    user/group, and orders `PATH` so `/usr/local/bin` (the baked agents) wins
@@ -706,10 +767,12 @@ Files created inside the container will appear to be owned by UID/GID 1000 in th
 6. `docker run --rm -i --network host --user UID:GID --workdir <cwd>` runs
    the selected command with host-shaped paths and inherited stdio. `-t` is
    added only when stdin is an interactive terminal. The host Wayland socket
-   is added when the session has one, `--voice` adds the sound-server
-   socket and/or `--device /dev/snd` (see [Audio](#audio---voice)), and
-   `--serial` adds `--device` for each USB serial node (see
-   [USB serial](#usb-serial---serial)).
+   and a private runtime tmpfs are added when the session has one, unless
+   `--no-mount-wayland` (see
+   [Wayland windows](#wayland-windows---mount-wayland)),
+   `--voice` adds the sound-server socket and/or `--device /dev/snd` (see
+   [Audio](#audio---voice)), and `--serial` adds `--device` for each USB
+   serial node (see [USB serial](#usb-serial---serial)).
 
 ## Customization
 

@@ -30,8 +30,11 @@ paths. The threat model and what's in/out of scope is documented in the
   the explicitly-mounted set.
 - Bypasses of read-only mounts such as `~/.rustup`, `~/.local/bin`, or
   `~/.local/share/claude`.
-- Anything that exposes more host IPC than the documented Wayland display
-  socket mount used for clipboard support.
+- Anything that exposes more host IPC or hardware than the documented opt-in
+  mounts: the Wayland display socket (default-on, withheld with
+  `--no-mount-wayland`), sound under `--voice`, USB serial under `--serial`.
+- Any of the opt-in ones reaching the container without its flag, or the
+  Wayland socket reaching it under `--no-mount-wayland`.
 - Code execution on the host triggered by something that should run only
   inside the container, such as a malicious build script.
 - Privilege escalation on the host that the tool's design enables.
@@ -49,8 +52,8 @@ paths. The threat model and what's in/out of scope is documented in the
   `~/.config/opencode`, `~/.local/share/opencode`, `~/.gemini`,
   `~/.config/antigravity`, `~/.grok`, and the wrangler and gh config dirs
   under their own verbs or `--mount-<tool>`).
-- Clipboard access through the documented Wayland socket mount when the host
-  has a Wayland session.
+- Windows, clipboard access, and anything else a Wayland client can do
+  through the Wayland socket mount.
 - Anything that requires the attacker to already have host shell.
 - Network access from inside the container. `arbox` intentionally uses host
   networking.
