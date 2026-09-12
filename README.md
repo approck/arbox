@@ -84,6 +84,18 @@ or a process that you intentionally gave access to your mounted credentials.
   has no client isolation, whereas a Wayland client sees only its own
   windows, which is what makes a default-on display tolerable. See
   [Wayland windows](#wayland-windows---mount-wayland).
+- **The GPU is NOT bound unless you pass `--gpu`.** With the flag, the DRM
+  render nodes under `/dev/dri` (`renderD*`, never `card*`) are passed
+  through with `--device` and the owning group (`render`) is added inside
+  the container — which grants access even if your host user isn't in that
+  group. On a host with NVIDIA's driver and the NVIDIA Container Toolkit,
+  the flag instead passes `--gpus all`, which mounts the driver's libraries
+  from the host and the whole `/dev/nvidia*` set; with the driver but no
+  toolkit it refuses to launch and prints the install steps. Windows do not
+  need any of it: the image's Mesa renders in software. It stays opt-in
+  because a render node exposes the DRM driver's ioctl surface (a kernel
+  escape route if the driver has a bug) and GPU memory that other processes'
+  data can leak through. See [GPU](#gpu---gpu).
 - **Audio is NOT bound unless you pass `--voice`.** With the flag, the
   container gets the host's PulseAudio/PipeWire socket and/or the ALSA
   devices under `/dev/snd` — that is a live microphone and speakers for
@@ -223,7 +235,8 @@ clear message.
 | `arbox [OPTIONS] run CMD...`    | Run a one-off command inside the container. No agent state is mounted. |
 | `arbox update`                  | Refresh the baked-in agents (claude, codex, opencode, agy, grok) to their latest published versions, rebuilding only the agent layers (quick — the apt/node/playwright layers stay cached). Builds the image from scratch if it doesn't exist yet. |
 | `arbox update --force`          | Full clean rebuild of the entire image (`--no-cache`): re-runs apt, node, the Playwright browser downloads, everything. |
-| `arbox status`                  | Show host facts, mount layout, image presence, network mode, whether the wrangler and gh config dirs are bound, and detected host audio, USB serial devices, and Wayland socket. Works outside a git repository (skips the workspace mount in that case). |
+| `arbox install-nvidia-container-toolkit` | Install the NVIDIA Container Toolkit on an Ubuntu host (apt via sudo, every step printed first), the piece `--gpu` needs for an NVIDIA GPU. Also choice (2) of the menu `--gpu` shows when it is missing. See [NVIDIA](#nvidia). |
+| `arbox status`                  | Show host facts, mount layout, image presence, network mode, whether the wrangler and gh config dirs are bound, and detected host audio, USB serial devices, Wayland socket, and GPU nodes. Works outside a git repository (skips the workspace mount in that case). |
 | `arbox clean`                   | Remove every arbox image whose tag has the current host's prefix. |
 
 **arbox options go before the verb. Everything after the verb belongs to the
@@ -242,8 +255,8 @@ know). `arbox --help` lists every option.
 
 `claude`, `codex`, `opencode`, `agy`, `grok`, `playwright`, `wrangler`, `gh`,
 `bash`, and `run` must be invoked from inside a git repository — they mount the git toplevel as
-the workspace and `cd` into your current directory. `status`, `update`, and
-`clean` do not require a repo.
+the workspace and `cd` into your current directory. `status`, `update`,
+`clean`, and `install-nvidia-container-toolkit` do not require a repo.
 
 ### Extra bind-mount flags
 
@@ -490,7 +503,8 @@ The image ships the userspace side: the Wayland client libraries, Mesa's GL
 and Vulkan drivers **including their software rasterizers** (llvmpipe and
 lavapipe), fontconfig and a cursor theme, GTK 4 and libadwaita with their dev
 headers for gtk-rs builds, and `eglinfo` / `vulkaninfo` to check what an app
-will get. So a window works with no GPU passthrough at all.
+will get. So a window works with no GPU passthrough at all — `--gpu`
+makes it fast, it doesn't make it possible.
 
 Two Rust-side gotchas worth knowing: Bevy's default features enable X11 only,
 so a Bevy project must turn on its `wayland` cargo feature or it will fail to
@@ -506,6 +520,136 @@ wayland: socket /run/user/1000/wayland-0 (bound by default; --no-mount-wayland t
 The mount is Linux-only. On Windows and macOS there is no host compositor for
 Docker Desktop's VM to reach, so the default silently binds nothing and
 `--mount-wayland` errors out immediately.
+
+### GPU (`--gpu`)
+
+No GPU reaches the container by default. Pass `--gpu` (before any launch
+verb) to bind the host's DRM render nodes in, so that GL and Vulkan inside
+run on the hardware instead of Mesa's software rasterizers:
+
+```bash
+arbox --gpu run cargo run           # hardware-rendered window
+arbox --gpu bash                    # then: vulkaninfo --summary
+```
+
+What gets bound:
+
+| Host thing                                          | How it's passed |
+|-----------------------------------------------------|-----------------|
+| The render nodes under `/dev/dri` (`renderD*`)      | `--device` per node, plus `--group-add` for the group owning them (`render`) — `--user UID:GID` drops the host user's supplementary groups, so without it the mode-0660 nodes stay unopenable. A wildcard `--device-cgroup-rule` on the DRM major keeps a node reachable if it re-enumerates. |
+
+The `card*` (primary) nodes are never bound. They add kernel modesetting and
+DRM master to what a render node offers, and while your compositor holds
+master a container process can't take it, the moment it is free — a VT
+switch, a compositor crash — a process holding the card node could grab it
+and scan out or read framebuffers. Mesa on Wayland does every GL, Vulkan and
+VA-API operation through the render node, so card access would buy nothing.
+
+Why it is opt-in when the display is not: a render node exposes the DRM
+driver's ioctl surface — i915 and amdgpu are among the largest and most
+CVE-prone drivers in the kernel, and an exploitable bug there is a container
+escape — and it shares GPU memory, which drivers zero far less rigorously
+than the CPU side (the LeftoverLocals research read other processes' data
+out of GPU-local memory on several vendors' parts). Neither is a reason to
+never use it; both are reasons an `arbox claude` session that isn't doing
+graphics shouldn't carry it. Note also that `--group-add` grants access
+inside even when your host user isn't in `render` on the host.
+
+This covers every GPU Mesa drives — Intel, AMD, virtio in a VM, nouveau —
+because the userspace drivers are in the image and the nodes are all the
+container needs.
+
+#### NVIDIA
+
+NVIDIA's proprietary driver is different: Mesa has no driver for it, and its
+userspace libraries (`libnvidia-glcore`, the EGL and Vulkan ICDs, `libcuda`)
+must match the host kernel module version exactly, so they cannot be baked
+into the image. The [NVIDIA Container
+Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html)
+injects them at `docker run` time instead, and `--gpu` drives that when the
+toolkit is installed: it passes `--gpus all` with
+`NVIDIA_DRIVER_CAPABILITIES=all`, which turns on graphics and display (the
+EGL/Vulkan ICDs and the Wayland EGL platform) on top of the toolkit's default
+compute-only set. Any Mesa render nodes on the same host (a hybrid laptop's
+iGPU) are bound alongside.
+
+`--gpu` probes for the three pieces — an NVIDIA display device on the PCI
+bus, the kernel driver (`/dev/nvidiactl`), and the toolkit's runtime hook on
+`PATH` — and when one is missing it **refuses to launch and prints the
+install commands** for exactly that piece, rather than silently handing over
+a lavapipe container that looks like it worked:
+
+| Host state | What `--gpu` does |
+|------------|-------------------|
+| No NVIDIA device | Mesa path only, as above. |
+| Card present, no driver loaded | Fails: run `sudo ubuntu-drivers install` and reboot. RTX 50-series needs driver 570+ with the open kernel modules. A card driven by nouveau is a Mesa GPU and needs nothing. |
+| Driver loaded, toolkit missing | Shows a one-keypress menu on a terminal (see below); without one, fails and prints the by-hand steps: `apt-get install nvidia-container-toolkit`, the NVIDIA apt repository setup when the release lacks the package, `nvidia-ctk runtime configure --runtime=docker`, the docker restart, and the `docker run --gpus all ubuntu nvidia-smi` check. |
+| Driver and toolkit present | `--gpus all`, plus the Mesa nodes if any. |
+
+The check happens before any image build, and `arbox status` shows the same
+diagnosis on its `gpu:` line, so a host that has the card but not the
+toolkit says so before you reach for the flag. Blackwell cards (RTX 50-series)
+need driver 570 or newer; the probe reports whatever version the kernel has,
+it does not gate on it.
+
+When `--gpu` is run from a terminal and the only missing piece is the
+toolkit, arbox stops and asks:
+
+```
+==== arbox: NVIDIA GPU found, but it cannot reach the container ====
+
+  NVIDIA driver 595.91.07 is loaded on this host, but the NVIDIA Container Toolkit is not installed,
+  so docker has no way to hand the GPU over.
+
+  (1) print installation instructions and exit
+
+  (2) install it now
+      restarts as `arbox install-nvidia-container-toolkit` (apt via sudo)
+
+  (q) exit
+
+  press [1/2/q]:
+```
+
+A single keypress answers it, no Enter needed. Headings and step markers are
+coloured when stderr is a terminal; `NO_COLOR` or `TERM=dumb` turns that off.
+Choice (2) `exec`s the process into the `install-nvidia-container-toolkit`
+verb, which is also runnable directly. It lists its steps up front, prints a
+`step N/M` heading and the exact `sudo` command line before each one, runs it
+with your stdio attached (so sudo can prompt), re-probes when done,
+and then tells you to **re-run your `arbox --gpu ...` command** — it does not
+re-launch it. The package comes from Ubuntu's own archive when the release
+carries it (`nvidia-container-toolkit` is in universe from the series after
+26.10 — `apt-cache policy nvidia-container-toolkit` shows a Candidate), and
+from NVIDIA's repository at `nvidia.github.io/libnvidia-container` otherwise,
+where the keyring and source list are set up exactly as NVIDIA's install
+guide describes. Choice (2) is Ubuntu-only; other distros see (1) and (q). A
+non-interactive session skips the menu and gets the printed steps as the
+error. arbox never runs `sudo` from inside a launch.
+
+Two NVIDIA-specific caveats. The toolkit mounts driver libraries from the host
+filesystem and exposes the full `/dev/nvidia*` device set, which is a larger
+grant than a single render node, so the same opt-in reasoning applies with
+more force. And the image carries no CUDA toolkit: CUDA *runtime* libraries
+come in from the host via the toolkit, so prebuilt CUDA programs and
+`nvidia-smi` work, but compiling CUDA code needs `nvcc` added to the image.
+
+#### Failure modes and status
+
+`--gpu` fails immediately when the host has no render node and no usable
+NVIDIA path — a VM without a virtual GPU, or a headless box with no display
+driver loaded. It does not need a display: compute-only use (a wgpu or Vulkan
+compute test, video transcoding through VA-API, CUDA) works under
+`--no-mount-wayland` too. `arbox status` reports what it can see:
+
+```
+gpu:     /dev/dri/renderD128 (bound only with --gpu)
+gpu:     NVIDIA driver 580.65.06 via container toolkit + /dev/dri/renderD128 (bound only with --gpu)
+gpu:     /dev/dri/renderD128 (bound only with --gpu); NVIDIA driver 580.65.06 present but the container toolkit is missing — `arbox --gpu` explains
+```
+
+`--gpu` is Linux-only. It errors out immediately on both Windows and macOS,
+since Docker Desktop's VM has no DRM passthrough on either.
 
 ### Auth profiles (`--profile`)
 
@@ -769,7 +913,8 @@ Files created inside the container will appear to be owned by UID/GID 1000 in th
    added only when stdin is an interactive terminal. The host Wayland socket
    and a private runtime tmpfs are added when the session has one, unless
    `--no-mount-wayland` (see
-   [Wayland windows](#wayland-windows---mount-wayland)),
+   [Wayland windows](#wayland-windows---mount-wayland)), `--gpu` adds
+   `--device` for each `/dev/dri` render node (see [GPU](#gpu---gpu)),
    `--voice` adds the sound-server socket and/or `--device /dev/snd` (see
    [Audio](#audio---voice)), and `--serial` adds `--device` for each USB
    serial node (see [USB serial](#usb-serial---serial)).

@@ -70,6 +70,9 @@ struct Cli {
     /// host has a Wayland session; spelling it out makes a missing session a
     /// hard error instead of a silent skip. Wayland only — the X11 socket is
     /// never mounted. Linux only.
+    ///
+    /// Windows render in software (Mesa llvmpipe/lavapipe) unless --gpu is
+    /// also given.
     #[arg(long = "mount-wayland")]
     mount_wayland: bool,
 
@@ -77,6 +80,17 @@ struct Cli {
     /// clipboard, no display of any kind inside the container.
     #[arg(long = "no-mount-wayland", conflicts_with = "mount_wayland")]
     no_mount_wayland: bool,
+
+    /// Bind the host's GPU into the container: the DRM render nodes
+    /// under /dev/dri (renderD*, never card*), with the owning group re-added
+    /// so they're openable. Off by default — without it GL and Vulkan inside
+    /// use Mesa's software rasterizers; fails if the host has no render node.
+    /// Mesa GPUs (Intel, AMD, virtio) bind their render nodes; an NVIDIA GPU
+    /// goes through the NVIDIA Container Toolkit (`--gpus all`) when it is
+    /// installed, and otherwise the launch stops and prints what to install.
+    /// Linux only.
+    #[arg(long = "gpu")]
+    gpu: bool,
 
     // Per-agent state mounts. Each agent verb mounts its OWN state and
     // nothing else; every other verb (bash, run, playwright) mounts none. So
@@ -288,6 +302,16 @@ enum Cmd {
         #[arg(long)]
         force: bool,
     },
+    /// Install the NVIDIA Container Toolkit on this Ubuntu host (runs apt
+    /// via sudo), so `arbox --gpu` can hand an NVIDIA GPU to the container.
+    ///
+    /// Also reachable as choice (2) of the menu `--gpu` shows when the NVIDIA
+    /// driver is loaded but the toolkit is missing. Uses Ubuntu's own package
+    /// when the release carries it, else adds NVIDIA's apt repository. Prints
+    /// every sudo step before running it. Does not re-launch anything: re-run
+    /// your `arbox --gpu ...` command afterwards.
+    #[command(name = "install-nvidia-container-toolkit")]
+    InstallNvidiaContainerToolkit,
     /// Show host facts, image presence, and mount layout.
     Status,
     /// Remove every arbox image for this host.
@@ -356,6 +380,7 @@ fn main() -> ExitCode {
             (_, true) => Some(false),
             _ => None,
         },
+        gpu: cli.gpu,
         mounts,
     };
     match dispatch(cli.cmd, opts) {
@@ -380,6 +405,7 @@ fn dispatch(cmd: Cmd, opts: launch::Opts) -> Result<ExitCode> {
         Cmd::Gh { args } => launch::run_gh(args, opts),
         Cmd::Run { cmd } => launch::run_argv(cmd, opts),
         Cmd::Update { force } => image::update_image(force).map(|_| ExitCode::SUCCESS),
+        Cmd::InstallNvidiaContainerToolkit => launch::install_nvidia_container_toolkit(),
         Cmd::Status => {
             image::print_status(opts.profile.as_deref(), &opts.mounts).map(|_| ExitCode::SUCCESS)
         }

@@ -323,5 +323,10 @@ pub fn print_status(profile: Option<&str>, mounts: &crate::launch::MountOverride
         "wayland: {}",
         crate::launch::detect_wayland(&host).summary()
     );
+    let nvidia = crate::launch::probe_nvidia();
+    println!(
+        "gpu:     {}",
+        crate::launch::detect_gpu(&nvidia).summary(&nvidia)
+    );
     Ok(())
 }

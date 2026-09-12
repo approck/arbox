@@ -32,9 +32,11 @@ paths. The threat model and what's in/out of scope is documented in the
   `~/.local/share/claude`.
 - Anything that exposes more host IPC or hardware than the documented opt-in
   mounts: the Wayland display socket (default-on, withheld with
-  `--no-mount-wayland`), sound under `--voice`, USB serial under `--serial`.
-- Any of the opt-in ones reaching the container without its flag, or the
-  Wayland socket reaching it under `--no-mount-wayland`.
+  `--no-mount-wayland`), `/dev/dri` render nodes under `--gpu`, sound under
+  `--voice`, USB serial under `--serial`.
+- Any of the opt-in ones reaching the container without its flag, the
+  Wayland socket reaching it under `--no-mount-wayland`, or a `card*` node
+  reaching it at all.
 - Code execution on the host triggered by something that should run only
   inside the container, such as a malicious build script.
 - Privilege escalation on the host that the tool's design enables.
@@ -53,7 +55,10 @@ paths. The threat model and what's in/out of scope is documented in the
   `~/.config/antigravity`, `~/.grok`, and the wrangler and gh config dirs
   under their own verbs or `--mount-<tool>`).
 - Windows, clipboard access, and anything else a Wayland client can do
-  through the Wayland socket mount.
+  through the Wayland socket mount; GPU access under `--gpu`, including the
+  DRM driver attack surface and cross-process GPU memory leaks it brings, and
+  on NVIDIA hosts everything the NVIDIA Container Toolkit mounts under
+  `--gpus all`.
 - Anything that requires the attacker to already have host shell.
 - Network access from inside the container. `arbox` intentionally uses host
   networking.

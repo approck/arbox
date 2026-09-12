@@ -633,7 +633,7 @@ pub fn tool_summaries(host: &HostContext, sel: &Selection) -> Vec<(&'static str,
 
 /// Per-invocation launch options shared by every verb: the user's extra
 /// bind-mount paths, the optional `--profile` name, the per-tool mount
-/// overrides, the `--voice` / `--serial` opt-ins, and the
+/// overrides, the `--voice` / `--serial` / `--gpu` opt-ins, and the
 /// `--mount-wayland` / `--no-mount-wayland` override of the display default.
 /// Bundled so adding a cross-cutting knob doesn't ripple through every verb
 /// function's signature.
@@ -656,6 +656,9 @@ pub struct Opts {
     /// otherwise. `Some(true)` (`--mount-wayland`) makes a missing session a
     /// hard error; `Some(false)` (`--no-mount-wayland`) never binds it.
     pub wayland: Option<bool>,
+    /// Bind the host's DRM render nodes under `/dev/dri` into the container
+    /// (`--gpu`).
+    pub gpu: bool,
 }
 
 /// Which USB serial devices `--serial` should bind. Auto-detection binds
@@ -864,9 +867,13 @@ fn run(host: HostContext, argv: Vec<String>, opts: Opts, sel: &Selection) -> Res
         Some(false) => None,
         None => Some(detect_wayland(&host)).filter(|w| !w.is_empty()),
     };
+    let gpu = opts.gpu.then(|| require_gpu(&host)).transpose()?;
     if let Some(serial) = &serial {
         // stderr, so `arbox run -- foo | bar` pipelines stay clean.
         eprintln!("arbox: {}", serial.launch_note());
+    }
+    if let Some(gpu) = &gpu {
+        eprintln!("arbox: {}", gpu.launch_note());
     }
     let added_safe_dir = fixup_windows_worktree(&host)?;
     let mut mounts = mount_specs(&host, opts.profile.as_deref(), sel);
@@ -938,6 +945,9 @@ fn run(host: HostContext, argv: Vec<String>, opts: Opts, sel: &Selection) -> Res
     }
     if let Some(serial) = &serial {
         serial.apply(&mut cmd);
+    }
+    if let Some(gpu) = &gpu {
+        gpu.apply(&mut cmd);
     }
 
     cmd.arg(&tag);
@@ -1083,6 +1093,791 @@ fn require_wayland(host: &HostContext) -> Result<WaylandAccess> {
         );
     }
     Ok(wayland)
+}
+
+/// The host GPU plumbing `--gpu` hands to the container: the DRM RENDER
+/// nodes under `/dev/dri`. Nothing here is bound without the flag, and the
+/// flag is deliberately not the default even though windows are: a render
+/// node exposes the DRM driver's ioctl surface (i915/amdgpu are among the
+/// largest, most CVE-prone drivers in the kernel — an exploitable bug there
+/// is a container escape) and shares GPU memory that drivers zero far less
+/// rigorously than the CPU side (LeftoverLocals-style leaks of other
+/// processes' buffers). Without the flag, GUI apps still run under the
+/// Wayland mount: the image's Mesa carries llvmpipe (GL) and lavapipe
+/// (Vulkan), so this is a performance upgrade, not a prerequisite.
+///
+/// `renderD*` only, never `card*`. A card (primary) node additionally
+/// carries kernel modesetting and DRM master: while the compositor holds
+/// master a client can't take it, but the moment it is free (a VT switch, a
+/// compositor crash) a process holding the card node could grab it and scan
+/// out or read framebuffers. Mesa on Wayland does every GL, Vulkan and VA-API
+/// operation through the render node, so card access buys nothing here.
+///
+/// Two backends, either or both of which may be present:
+///   - Mesa-driven GPUs (Intel, AMD, virtio, nouveau): the userspace drivers
+///     are in the image, so the render nodes are all the container needs.
+///   - NVIDIA's proprietary driver: its userspace must match the host kernel
+///     module byte-for-byte, so it can't be baked into the image. The NVIDIA
+///     Container Toolkit injects it at `docker run` time (`--gpus all`), and
+///     `--gpu` drives that when the toolkit is installed. `probe_nvidia`
+///     tells the missing-piece cases apart so `--gpu` can say exactly what to
+///     install rather than silently falling back to lavapipe.
+pub struct GpuAccess {
+    /// NVIDIA driver version (e.g. `580.65.06`) when the host has NVIDIA
+    /// hardware, its kernel driver, AND the container toolkit — the only
+    /// state in which `--gpus all` works. Anything short of that is a
+    /// `NvidiaState` for `--gpu` to explain, not a silent skip.
+    nvidia: Option<String>,
+    /// Render-node character devices under `/dev/dri` (`renderD*`), bound at
+    /// the same path.
+    devices: Vec<PathBuf>,
+    /// Supplementary gids owning those nodes (`render`, typically), deduped,
+    /// root excluded. Needed for the same reason as `/dev/snd`: `--user
+    /// uid:gid` drops the host user's supplementary groups, so the mode-0660
+    /// nodes are otherwise unopenable. Note this grants access inside even
+    /// when the host user isn't in `render` on the host.
+    gids: Vec<u32>,
+    /// Character-device majors of the bound nodes (226 for DRM), deduped. A
+    /// wildcard `--device-cgroup-rule` per major keeps a node reachable if it
+    /// re-enumerates (a hot-plugged eGPU, a display coming back from
+    /// suspend).
+    majors: Vec<u32>,
+}
+
+impl GpuAccess {
+    fn none() -> Self {
+        Self {
+            nvidia: None,
+            devices: Vec::new(),
+            gids: Vec::new(),
+            majors: Vec::new(),
+        }
+    }
+
+    /// Build the access set for already-validated device nodes, reading the
+    /// owning gids and majors off the filesystem rather than assuming
+    /// `render` is any particular gid, or exists at all — distros disagree.
+    fn for_devices(devices: Vec<PathBuf>) -> Self {
+        if devices.is_empty() {
+            return Self::none();
+        }
+        let mut gids = Vec::new();
+        let mut majors = Vec::new();
+        for dev in &devices {
+            if let Some((gid, major)) = device_owner_and_major(dev) {
+                if gid != 0 {
+                    gids.push(gid);
+                }
+                majors.push(major);
+            }
+        }
+        gids.sort_unstable();
+        gids.dedup();
+        majors.sort_unstable();
+        majors.dedup();
+        Self {
+            nvidia: None,
+            devices,
+            gids,
+            majors,
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.devices.is_empty() && self.nvidia.is_none()
+    }
+
+    /// Append the docker flags that carry this access into the container.
+    fn apply(&self, cmd: &mut Command) {
+        if self.nvidia.is_some() {
+            // `--gpus all` makes docker call the toolkit's runtime hook,
+            // which mounts the driver's userspace libraries and the
+            // /dev/nvidia* nodes into the container. The default capability
+            // set is compute+utility (CUDA and nvidia-smi only); `all` adds
+            // graphics and display — the EGL/Vulkan ICDs and the Wayland EGL
+            // platform — which is the whole point here.
+            cmd.args(["--gpus", "all"]);
+            cmd.arg("-e").arg("NVIDIA_DRIVER_CAPABILITIES=all");
+        }
+        for dev in &self.devices {
+            cmd.arg("--device").arg(dev);
+        }
+        for gid in &self.gids {
+            cmd.arg("--group-add").arg(gid.to_string());
+        }
+        for major in &self.majors {
+            cmd.arg("--device-cgroup-rule")
+                .arg(format!("c {major}:* rmw"));
+        }
+    }
+
+    fn device_list(&self) -> String {
+        let list: Vec<String> = self
+            .devices
+            .iter()
+            .map(|d| d.display().to_string())
+            .collect();
+        list.join(" ")
+    }
+
+    /// What would be handed over, as a list: the NVIDIA path first, then the
+    /// Mesa render nodes.
+    fn parts(&self) -> Vec<String> {
+        let mut parts = Vec::new();
+        if let Some(v) = &self.nvidia {
+            parts.push(format!("NVIDIA driver {v} via container toolkit"));
+        }
+        if !self.devices.is_empty() {
+            parts.push(self.device_list());
+        }
+        parts
+    }
+
+    /// One-line description for `arbox status`. Takes the NVIDIA probe so a
+    /// host with the hardware but not the toolkit says so here, where the
+    /// user looks first, instead of only failing later under `--gpu`.
+    pub fn summary(&self, nvidia: &NvidiaState) -> String {
+        let parts = self.parts();
+        let mut line = if parts.is_empty() {
+            "none detected on host".to_string()
+        } else {
+            format!("{} (bound only with --gpu)", parts.join(" + "))
+        };
+        if let Some(note) = nvidia.status_note() {
+            line.push_str("; ");
+            line.push_str(&note);
+        }
+        line
+    }
+
+    /// Printed once at launch under `--gpu`: what went in, since a
+    /// multi-GPU host hands over all of it.
+    fn launch_note(&self) -> String {
+        format!("GPU bound: {}", self.parts().join(" + "))
+    }
+}
+
+/// How far along the host is toward NVIDIA GPU access in a container. Each
+/// step short of `Ready` has one specific thing to install, and `--gpu`
+/// prints exactly that.
+#[derive(Debug, PartialEq, Eq)]
+pub enum NvidiaState {
+    /// No NVIDIA display device on the PCI bus.
+    Absent,
+    /// The card is there but no kernel driver claims it (`/dev/nvidiactl`
+    /// missing): a fresh install, or nouveau — which arbox treats as Mesa.
+    HardwareOnly,
+    /// Driver loaded but the NVIDIA Container Toolkit isn't installed, so
+    /// docker has no way to inject the matching userspace.
+    DriverOnly { version: String },
+    /// Driver and toolkit both present: `--gpus all` works.
+    Ready { version: String },
+}
+
+impl NvidiaState {
+    /// Classify from the three facts, in dependency order. Pure, for tests.
+    fn classify(pci_nvidia: bool, driver_version: Option<String>, toolkit: bool) -> Self {
+        match (pci_nvidia, driver_version, toolkit) {
+            (_, Some(version), true) => Self::Ready { version },
+            (_, Some(version), false) => Self::DriverOnly { version },
+            (true, None, _) => Self::HardwareOnly,
+            (false, None, _) => Self::Absent,
+        }
+    }
+
+    /// The `arbox status` note for a host that has an NVIDIA GPU it can't
+    /// yet use in a container. `None` when there's nothing to say.
+    fn status_note(&self) -> Option<String> {
+        match self {
+            Self::Absent | Self::Ready { .. } => None,
+            Self::HardwareOnly => {
+                Some("NVIDIA GPU present but no driver loaded — `arbox --gpu` explains".into())
+            }
+            Self::DriverOnly { version } => Some(format!(
+                "NVIDIA driver {version} present but the container toolkit is missing — \
+                 `arbox --gpu` explains"
+            )),
+        }
+    }
+
+    /// The `--gpu` error for a host that has an NVIDIA GPU it can't yet use:
+    /// what is missing, and the commands that fix it. `None` when nothing is
+    /// missing.
+    fn instructions(&self) -> Option<String> {
+        match self {
+            Self::Absent | Self::Ready { .. } => None,
+            Self::HardwareOnly => Some(
+                "--gpu: an NVIDIA GPU is on the PCI bus but no NVIDIA kernel driver is loaded \
+                 (/dev/nvidiactl is missing). Install the driver on the host, then reboot:\n\
+                 \n    \
+                 sudo ubuntu-drivers install\n\
+                 \n\
+                 RTX 50-series (Blackwell) cards need driver 570 or newer and the OPEN kernel \
+                 modules (the `-open` package variant); `ubuntu-drivers` picks that on a \
+                 current Ubuntu. If the card is driven by nouveau instead, it is a Mesa GPU \
+                 to arbox and shows up under /dev/dri — nothing to install, but no CUDA."
+                    .to_string(),
+            ),
+            Self::DriverOnly { version } => Some(format!(
+                "--gpu: NVIDIA driver {version} is loaded, but the NVIDIA Container Toolkit is \
+                 not installed, so docker cannot inject the matching driver libraries into the \
+                 container (Mesa in the image has no driver for NVIDIA hardware — without the \
+                 toolkit you would get lavapipe). On an Ubuntu host, `arbox --gpu` offers to \
+                 install it when run from a terminal. By hand:\n\
+                 \n    \
+                 sudo apt-get install -y nvidia-container-toolkit\n\
+                 \n\
+                 works as-is on Ubuntu releases that carry the package in their own archive \
+                 (`apt-cache policy nvidia-container-toolkit` shows a Candidate). Otherwise \
+                 add NVIDIA's repository first:\n\
+                 \n    \
+                 curl -fsSL {NVIDIA_TOOLKIT_GPGKEY_URL} \\\n      \
+                 | sudo gpg --dearmor -o {NVIDIA_TOOLKIT_KEYRING}\n    \
+                 curl -fsSL {NVIDIA_TOOLKIT_LIST_URL} \\\n      \
+                 | sed 's#deb https://#deb [signed-by={NVIDIA_TOOLKIT_KEYRING}] https://#' \\\n      \
+                 | sudo tee {NVIDIA_TOOLKIT_LIST}\n    \
+                 sudo apt-get update && sudo apt-get install -y nvidia-container-toolkit\n\
+                 \n\
+                 Then, either way:\n\
+                 \n    \
+                 sudo nvidia-ctk runtime configure --runtime=docker\n    \
+                 sudo systemctl restart docker\n\
+                 \n\
+                 Verify with:  docker run --rm --gpus all ubuntu nvidia-smi\n\
+                 (Reference: https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html)"
+            )),
+        }
+    }
+}
+
+const NVIDIA_TOOLKIT_GPGKEY_URL: &str = "https://nvidia.github.io/libnvidia-container/gpgkey";
+const NVIDIA_TOOLKIT_LIST_URL: &str =
+    "https://nvidia.github.io/libnvidia-container/stable/deb/nvidia-container-toolkit.list";
+const NVIDIA_TOOLKIT_KEYRING: &str = "/usr/share/keyrings/nvidia-container-toolkit-keyring.gpg";
+const NVIDIA_TOOLKIT_LIST: &str = "/etc/apt/sources.list.d/nvidia-container-toolkit.list";
+
+/// One step of the toolkit install: a heading for the terminal and the
+/// argv run through `sudo`.
+struct InstallStep {
+    label: &'static str,
+    argv: Vec<String>,
+}
+
+impl InstallStep {
+    fn new(label: &'static str, parts: &[&str]) -> Self {
+        Self {
+            label,
+            argv: parts.iter().map(|s| s.to_string()).collect(),
+        }
+    }
+
+    fn command_line(&self) -> String {
+        format!("sudo {}", self.argv.join(" "))
+    }
+}
+
+/// The host commands that install the NVIDIA Container Toolkit on Ubuntu.
+/// `distro_has_package` is whether apt already knows a
+/// `nvidia-container-toolkit` candidate — true on Ubuntu releases that carry
+/// it in their own archive (universe, from the series after 26.10), in which
+/// case NVIDIA's repository is not added. Pure, so the plan can be tested
+/// without running anything.
+fn nvidia_toolkit_install_plan(distro_has_package: bool) -> Vec<InstallStep> {
+    let mut plan = Vec::new();
+    if !distro_has_package {
+        // NVIDIA's documented repo setup, as one shell step: the keyring is
+        // dearmored from their signing key, and their .list is rewritten to
+        // pin that keyring. `--yes` so a re-run over a stale keyring works.
+        plan.push(InstallStep::new(
+            "add NVIDIA's apt repository and signing key",
+            &[
+                "sh",
+                "-c",
+                &format!(
+                    "curl -fsSL {NVIDIA_TOOLKIT_GPGKEY_URL} | gpg --dearmor --yes -o \
+                     {NVIDIA_TOOLKIT_KEYRING} && curl -fsSL {NVIDIA_TOOLKIT_LIST_URL} | sed \
+                     's#deb https://#deb [signed-by={NVIDIA_TOOLKIT_KEYRING}] https://#' > \
+                     {NVIDIA_TOOLKIT_LIST}"
+                ),
+            ],
+        ));
+        plan.push(InstallStep::new(
+            "refresh the apt package lists",
+            &["apt-get", "update"],
+        ));
+    }
+    plan.push(InstallStep::new(
+        "install nvidia-container-toolkit",
+        &["apt-get", "install", "-y", "nvidia-container-toolkit"],
+    ));
+    // Registers the `nvidia` runtime in /etc/docker/daemon.json. `--gpus all`
+    // itself only needs the hook on PATH, but this is the documented step and
+    // what compose / `--runtime=nvidia` users expect to find afterwards.
+    plan.push(InstallStep::new(
+        "register the nvidia runtime with docker",
+        &["nvidia-ctk", "runtime", "configure", "--runtime=docker"],
+    ));
+    plan.push(InstallStep::new(
+        "restart docker",
+        &["systemctl", "restart", "docker"],
+    ));
+    plan
+}
+
+/// Minimal ANSI styling for arbox's own terminal output. Colour only when
+/// stderr is a terminal and the usual opt-outs (`NO_COLOR`, `TERM=dumb`) are
+/// absent, so logs and pipes see plain text. No crate: four escape codes.
+struct Style {
+    on: bool,
+}
+
+impl Style {
+    fn detect() -> Self {
+        let on = std::io::stderr().is_terminal()
+            && std::env::var_os("NO_COLOR").is_none()
+            && std::env::var_os("TERM").is_none_or(|t| t != "dumb");
+        Self { on }
+    }
+
+    fn paint(&self, code: &str, text: &str) -> String {
+        if self.on {
+            format!("\x1b[{code}m{text}\x1b[0m")
+        } else {
+            text.to_string()
+        }
+    }
+
+    fn bold(&self, text: &str) -> String {
+        self.paint("1", text)
+    }
+
+    fn cyan(&self, text: &str) -> String {
+        self.paint("1;36", text)
+    }
+
+    fn green(&self, text: &str) -> String {
+        self.paint("1;32", text)
+    }
+
+    fn yellow(&self, text: &str) -> String {
+        self.paint("33", text)
+    }
+
+    fn red(&self, text: &str) -> String {
+        self.paint("1;31", text)
+    }
+
+    fn dim(&self, text: &str) -> String {
+        self.paint("2", text)
+    }
+
+    /// A top-level heading, set off by blank lines.
+    fn heading(&self, text: &str) {
+        eprintln!();
+        eprintln!("{}", self.cyan(&format!("==== {text} ====")));
+        eprintln!();
+    }
+
+    /// A step heading within a run.
+    fn step(&self, index: usize, total: usize, text: &str) {
+        eprintln!();
+        eprintln!(
+            "{} {}",
+            self.bold(&format!("---- step {index}/{total}:")),
+            self.bold(text)
+        );
+    }
+}
+
+/// Does the host's apt already know a `nvidia-container-toolkit` candidate?
+/// `apt-cache policy` prints `Candidate: (none)` for a known-but-unavailable
+/// name and nothing useful for an unknown one; only a real version counts.
+fn apt_has_candidate(package: &str) -> bool {
+    Command::new("apt-cache")
+        .args(["policy", package])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .is_some_and(|o| {
+            String::from_utf8_lossy(&o.stdout).lines().any(|l| {
+                l.trim_start()
+                    .strip_prefix("Candidate:")
+                    .is_some_and(|v| v.trim() != "(none)" && !v.trim().is_empty())
+            })
+        })
+}
+
+/// The verb name option (2) of the missing-toolkit menu restarts under.
+pub const INSTALL_NVIDIA_TOOLKIT_VERB: &str = "install-nvidia-container-toolkit";
+
+/// What `--gpu` does when the NVIDIA driver is loaded but the container
+/// toolkit is not: put three clear choices to the user and never guess.
+/// Only returns (as an error) when there is no terminal to ask on — then the
+/// by-hand instructions ARE the error. Otherwise every choice ends this
+/// process: print the instructions and exit, `exec` into
+/// `arbox install-nvidia-container-toolkit` so the install runs as its own
+/// clearly-labelled process, or just exit. arbox never runs `sudo` from
+/// inside a launch. One keypress, no Enter.
+fn missing_toolkit_menu(host: &HostContext, version: &str, instructions: &str) -> Result<()> {
+    if !std::io::stdin().is_terminal() {
+        bail!("{instructions}");
+    }
+    let ubuntu = host.distro_id == "ubuntu";
+    let st = Style::detect();
+    st.heading("arbox: NVIDIA GPU found, but it cannot reach the container");
+    eprintln!(
+        "  NVIDIA driver {} is loaded on this host, but the {} is not installed,",
+        st.bold(version),
+        st.bold("NVIDIA Container Toolkit")
+    );
+    eprintln!("  so docker has no way to hand the GPU over.");
+    eprintln!();
+    eprintln!(
+        "  {} print installation instructions and exit",
+        st.bold("(1)")
+    );
+    eprintln!();
+    if ubuntu {
+        eprintln!("  {} install it now", st.bold("(2)"));
+        eprintln!(
+            "      {}",
+            st.dim(&format!(
+                "restarts as `arbox {INSTALL_NVIDIA_TOOLKIT_VERB}` (apt via sudo)"
+            ))
+        );
+    } else {
+        eprintln!(
+            "  {}",
+            st.yellow(&format!(
+                "(installing from here is Ubuntu-only; this host is {})",
+                host.distro_id
+            ))
+        );
+    }
+    eprintln!();
+    eprintln!("  {} exit", st.bold("(q)"));
+    eprintln!();
+    let choices = if ubuntu { "1/2/q" } else { "1/q" };
+    loop {
+        eprint!("  {} ", st.bold(&format!("press [{choices}]:")));
+        let key = read_key()?;
+        match key {
+            Some(b'1') => {
+                eprintln!("1");
+                eprintln!();
+                eprintln!("{instructions}");
+                std::process::exit(1);
+            }
+            Some(b'2') if ubuntu => {
+                eprintln!("2");
+                return exec_self(&[INSTALL_NVIDIA_TOOLKIT_VERB]);
+            }
+            // q, Esc, Ctrl-C, Ctrl-D, or a closed stdin: leave.
+            Some(b'q' | b'Q' | 0x1b | 0x03 | 0x04) | None => {
+                eprintln!("q");
+                eprintln!("arbox: exiting.");
+                std::process::exit(1);
+            }
+            Some(_) => {
+                eprintln!();
+                continue;
+            }
+        }
+    }
+}
+
+/// Read one keypress from the terminal without waiting for Enter: switch
+/// stdin out of canonical mode (and echo, and signal generation — so Ctrl-C
+/// comes back as a byte we can act on after restoring the terminal, rather
+/// than killing us mid-raw-mode and leaving the shell without echo) for the
+/// duration of a single byte read, then put it back exactly as it was.
+/// `None` on end of input.
+#[cfg(unix)]
+fn read_key() -> Result<Option<u8>> {
+    use std::io::Read;
+    let fd = libc::STDIN_FILENO;
+    let mut original = std::mem::MaybeUninit::<libc::termios>::uninit();
+    // SAFETY: tcgetattr writes a termios into the pointed-to storage on
+    // success, which is what assume_init relies on below.
+    if unsafe { libc::tcgetattr(fd, original.as_mut_ptr()) } != 0 {
+        return Err(std::io::Error::last_os_error()).context("tcgetattr on stdin");
+    }
+    // SAFETY: checked the success return above.
+    let original = unsafe { original.assume_init() };
+    let mut raw = original;
+    raw.c_lflag &= !(libc::ICANON | libc::ECHO | libc::ISIG);
+    raw.c_cc[libc::VMIN] = 1;
+    raw.c_cc[libc::VTIME] = 0;
+    // SAFETY: plain FFI on a valid fd with a fully-initialised termios.
+    if unsafe { libc::tcsetattr(fd, libc::TCSANOW, &raw) } != 0 {
+        return Err(std::io::Error::last_os_error()).context("tcsetattr on stdin");
+    }
+    let mut buf = [0u8; 1];
+    let read = std::io::stdin().read(&mut buf);
+    // Restore before looking at the result, whatever it was.
+    // SAFETY: as above; `original` is the termios we read at the top.
+    let restored = unsafe { libc::tcsetattr(fd, libc::TCSANOW, &original) };
+    let n = read.context("reading a keypress")?;
+    if restored != 0 {
+        return Err(std::io::Error::last_os_error()).context("restoring the terminal");
+    }
+    Ok((n == 1).then_some(buf[0]))
+}
+
+#[cfg(not(unix))]
+fn read_key() -> Result<Option<u8>> {
+    // Never reached: the menu sits behind the Linux-only --gpu path.
+    Ok(None)
+}
+
+/// Replace this process with `arbox <args>`. Only returns on failure.
+#[cfg(unix)]
+fn exec_self(args: &[&str]) -> Result<()> {
+    use std::os::unix::process::CommandExt;
+    let exe = std::env::current_exe().context("locating the arbox binary")?;
+    eprintln!(
+        "{}",
+        Style::detect().dim(&format!("arbox: restarting as `arbox {}`", args.join(" ")))
+    );
+    let err = Command::new(&exe).args(args).exec();
+    Err(err).with_context(|| format!("exec {} {}", exe.display(), args.join(" ")))
+}
+
+#[cfg(not(unix))]
+fn exec_self(args: &[&str]) -> Result<()> {
+    bail!(
+        "cannot restart as `arbox {}` on this platform",
+        args.join(" ")
+    )
+}
+
+/// `arbox install-nvidia-container-toolkit`: install the NVIDIA Container
+/// Toolkit on an Ubuntu host, the piece `--gpu` needs and cannot do without.
+/// Reachable directly, and by choice (2) of the `--gpu` menu. Prints every
+/// `sudo` step before running it, re-probes afterwards, and on success tells
+/// the user to re-run whatever they were doing — it does not re-launch it.
+pub fn install_nvidia_container_toolkit() -> Result<ExitCode> {
+    let host = host::detect()?;
+    let nvidia = probe_nvidia();
+    match &nvidia {
+        NvidiaState::Ready { version } => {
+            eprintln!(
+                "arbox: the NVIDIA Container Toolkit is already installed (driver {version}); \
+                 nothing to do."
+            );
+            return Ok(ExitCode::SUCCESS);
+        }
+        NvidiaState::Absent => bail!(
+            "{INSTALL_NVIDIA_TOOLKIT_VERB}: no NVIDIA display device on the PCI bus; there is \
+             nothing for the toolkit to expose"
+        ),
+        NvidiaState::HardwareOnly => bail!(
+            "{}",
+            nvidia
+                .instructions()
+                .unwrap_or_else(|| "NVIDIA driver not loaded".to_string())
+        ),
+        NvidiaState::DriverOnly { .. } => {}
+    }
+    if host.distro_id != "ubuntu" {
+        bail!(
+            "{INSTALL_NVIDIA_TOOLKIT_VERB} is Ubuntu-only (this host is {}); install by hand:\n\
+             {}",
+            host.distro_id,
+            nvidia.instructions().unwrap_or_default()
+        );
+    }
+    let st = Style::detect();
+    st.heading("arbox: installing the NVIDIA Container Toolkit");
+    let distro_has_package = apt_has_candidate("nvidia-container-toolkit");
+    if distro_has_package {
+        eprintln!("  This Ubuntu release carries the toolkit in its own archive.");
+    } else {
+        eprintln!(
+            "  {}",
+            st.yellow(
+                "This Ubuntu release does not carry the toolkit; NVIDIA's apt repository \
+                 (nvidia.github.io/libnvidia-container) will be added first."
+            )
+        );
+    }
+    let plan = nvidia_toolkit_install_plan(distro_has_package);
+    eprintln!("  {} steps, each run with sudo:", plan.len());
+    for (i, step) in plan.iter().enumerate() {
+        eprintln!("    {} {}", st.dim(&format!("{}.", i + 1)), step.label);
+    }
+    for (i, step) in plan.iter().enumerate() {
+        st.step(i + 1, plan.len(), step.label);
+        eprintln!("{}", st.green(&format!("$ {}", step.command_line())));
+        let status = Command::new("sudo")
+            .args(&step.argv)
+            .stdin(Stdio::inherit())
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit())
+            .status()
+            .with_context(|| format!("running `{}`", step.command_line()))?;
+        if !status.success() {
+            eprintln!();
+            eprintln!(
+                "{}",
+                st.red(&format!(
+                    "==== arbox: step {}/{} failed ({status}) ====",
+                    i + 1,
+                    plan.len()
+                ))
+            );
+            bail!(
+                "`{}` exited with {status}; the toolkit install did not complete",
+                step.command_line()
+            );
+        }
+    }
+    match probe_nvidia() {
+        NvidiaState::Ready { version } => {
+            eprintln!();
+            eprintln!(
+                "{}",
+                st.green("==== arbox: NVIDIA Container Toolkit installed ====")
+            );
+            eprintln!();
+            eprintln!("  driver {version} is ready for containers.");
+            eprintln!(
+                "  {}",
+                st.bold("Re-run your `arbox --gpu ...` command to use it.")
+            );
+            eprintln!();
+            Ok(ExitCode::SUCCESS)
+        }
+        other => bail!(
+            "the install finished but the toolkit's runtime hook is still not on PATH \
+             (state: {other:?}); check the apt output above"
+        ),
+    }
+}
+
+/// Probe the host for the three NVIDIA facts. Linux-only; elsewhere there is
+/// no PCI bus to read and no toolkit to find, so `Absent`.
+pub fn probe_nvidia() -> NvidiaState {
+    if !cfg!(target_os = "linux") {
+        return NvidiaState::Absent;
+    }
+    let driver_version = if is_char_device(Path::new("/dev/nvidiactl")) {
+        // "NVRM version: NVIDIA UNIX Open Kernel Module for x86_64  580.65.06  Release Build …"
+        std::fs::read_to_string("/proc/driver/nvidia/version")
+            .ok()
+            .and_then(|s| nvidia_driver_version(&s))
+            .or_else(|| Some("(unknown version)".to_string()))
+    } else {
+        None
+    };
+    // `--gpus all` makes docker exec this hook by name from PATH; its
+    // presence is the toolkit's presence, and is what actually matters (the
+    // `nvidia-ctk runtime configure` step only registers a named runtime).
+    let toolkit = on_path("nvidia-container-runtime-hook");
+    NvidiaState::classify(pci_has_nvidia_display(), driver_version, toolkit)
+}
+
+/// Pull the driver version out of `/proc/driver/nvidia/version`: the first
+/// dotted-numeric token on the `NVRM version:` line.
+fn nvidia_driver_version(proc_text: &str) -> Option<String> {
+    proc_text
+        .lines()
+        .find(|l| l.starts_with("NVRM version:"))?
+        .split_whitespace()
+        .find(|tok| tok.contains('.') && tok.bytes().all(|b| b.is_ascii_digit() || b == b'.'))
+        .map(str::to_string)
+}
+
+/// Is there an NVIDIA display-class device on the PCI bus? Vendor 0x10de,
+/// class 0x03xxxx (VGA / 3D / display controller). Read from sysfs so it
+/// works without lspci and without a driver loaded.
+fn pci_has_nvidia_display() -> bool {
+    let Ok(entries) = std::fs::read_dir("/sys/bus/pci/devices") else {
+        return false;
+    };
+    entries.flatten().any(|e| {
+        let read = |name: &str| std::fs::read_to_string(e.path().join(name)).unwrap_or_default();
+        read("vendor").trim() == "0x10de" && read("class").trim().starts_with("0x03")
+    })
+}
+
+/// Is `name` an executable somewhere on `$PATH`? Plain filesystem lookup, no
+/// process spawned.
+fn on_path(name: &str) -> bool {
+    std::env::var_os("PATH")
+        .is_some_and(|path| std::env::split_paths(&path).any(|dir| dir.join(name).is_file()))
+}
+
+/// What GPU access the host currently offers: the Mesa render nodes, plus
+/// the NVIDIA toolkit path when `nvidia` says it's ready. Pure detection —
+/// no error when there's nothing, since `arbox status` reports the empty
+/// case; the not-quite-ready NVIDIA states are `require_gpu`'s to explain.
+///
+/// Linux-only by construction, like `detect_serial`: Docker Desktop's Linux
+/// VM on Windows and macOS has no DRM passthrough, so detection reports empty
+/// there rather than promising nodes `--gpu` then can't bind.
+pub fn detect_gpu(nvidia: &NvidiaState) -> GpuAccess {
+    if !cfg!(target_os = "linux") {
+        return GpuAccess::none();
+    }
+    let mut devices: Vec<PathBuf> = std::fs::read_dir("/dev/dri")
+        .ok()
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter(|e| e.file_name().to_str().is_some_and(is_render_node_name))
+        .map(|e| e.path())
+        .filter(|p| is_char_device(p))
+        .collect();
+    devices.sort();
+    let mut gpu = GpuAccess::for_devices(devices);
+    if let NvidiaState::Ready { version } = nvidia {
+        gpu.nvidia = Some(version.clone());
+    }
+    gpu
+}
+
+/// Is `name` a DRM render node (`renderD<n>`)? Card nodes (`card<n>`) and
+/// the `by-path` symlink dir are deliberately not matched — see `GpuAccess`.
+fn is_render_node_name(name: &str) -> bool {
+    name.strip_prefix("renderD")
+        .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+}
+
+/// `detect_gpu` for the `--gpu` path, where finding nothing is a hard error —
+/// the user asked for a GPU explicitly, so launching without one would just
+/// move the failure to the first `vulkaninfo`. An NVIDIA GPU that is missing
+/// its driver or the container toolkit is a hard error too, even when a Mesa
+/// render node (an iGPU, say) is also present: silently handing over the
+/// wrong GPU is exactly the confusion the flag exists to remove, and the
+/// error says what to install.
+fn require_gpu(host: &HostContext) -> Result<GpuAccess> {
+    if !cfg!(target_os = "linux") {
+        bail!(
+            "--gpu is Linux-only: Docker Desktop's Linux VM has no DRM passthrough on \
+             Windows or macOS"
+        );
+    }
+    let nvidia = probe_nvidia();
+    if let Some(instructions) = nvidia.instructions() {
+        // The one missing piece arbox can supply itself gets a menu; every
+        // other shortfall (no driver at all) is the by-hand instructions.
+        if let NvidiaState::DriverOnly { version } = &nvidia {
+            missing_toolkit_menu(host, version, &instructions)?;
+        }
+        bail!("{instructions}");
+    }
+    let gpu = detect_gpu(&nvidia);
+    if gpu.is_empty() {
+        bail!(
+            "--gpu: no DRM render node found under /dev/dri — expected a renderD* character \
+             device. A VM without a virtual GPU, a headless box with no display driver \
+             loaded, or a nested container without /dev/dri passed through will all look \
+             like this. Note that windows do NOT need this flag: the Wayland socket alone \
+             renders in software via Mesa's llvmpipe/lavapipe."
+        );
+    }
+    Ok(gpu)
 }
 
 /// The host sound plumbing `--voice` hands to the container. Nothing here is
@@ -1964,6 +2759,250 @@ mod tests {
             some.summary(),
             "socket /run/user/1000/wayland-0 (bound by default; --no-mount-wayland to withhold)"
         );
+    }
+
+    #[test]
+    fn render_node_name_matching() {
+        assert!(is_render_node_name("renderD128"));
+        assert!(is_render_node_name("renderD129"));
+        // Card nodes carry modesetting/DRM master and are never bound.
+        assert!(!is_render_node_name("card0"));
+        assert!(!is_render_node_name("card1"));
+        assert!(!is_render_node_name("by-path"));
+        assert!(!is_render_node_name("renderD"));
+        assert!(!is_render_node_name("renderDx"));
+    }
+
+    /// The docker flags are the contract: every node as `--device`, every
+    /// owning group re-added, a wildcard cgroup rule per major.
+    #[test]
+    fn gpu_apply_emits_device_group_and_cgroup_flags() {
+        let access = GpuAccess {
+            nvidia: None,
+            devices: vec![
+                PathBuf::from("/dev/dri/renderD128"),
+                PathBuf::from("/dev/dri/renderD129"),
+            ],
+            gids: vec![992],
+            majors: vec![226],
+        };
+        let mut cmd = Command::new("docker");
+        access.apply(&mut cmd);
+        let args: Vec<String> = cmd
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            args,
+            [
+                "--device",
+                "/dev/dri/renderD128",
+                "--device",
+                "/dev/dri/renderD129",
+                "--group-add",
+                "992",
+                "--device-cgroup-rule",
+                "c 226:* rmw",
+            ]
+        );
+        assert_eq!(
+            access.launch_note(),
+            "GPU bound: /dev/dri/renderD128 /dev/dri/renderD129"
+        );
+    }
+
+    #[test]
+    fn gpu_summary_reports_empty_and_populated() {
+        assert!(GpuAccess::none().is_empty());
+        assert_eq!(
+            GpuAccess::none().summary(&NvidiaState::Absent),
+            "none detected on host"
+        );
+        let some = GpuAccess {
+            nvidia: None,
+            devices: vec![PathBuf::from("/dev/dri/renderD128")],
+            gids: vec![992],
+            majors: vec![226],
+        };
+        assert_eq!(
+            some.summary(&NvidiaState::Absent),
+            "/dev/dri/renderD128 (bound only with --gpu)"
+        );
+
+        // The NVIDIA path shows up alongside any Mesa nodes (hybrid laptop).
+        let both = GpuAccess {
+            nvidia: Some("580.65.06".into()),
+            ..some
+        };
+        assert_eq!(
+            both.summary(&NvidiaState::Ready {
+                version: "580.65.06".into()
+            }),
+            "NVIDIA driver 580.65.06 via container toolkit + /dev/dri/renderD128 \
+             (bound only with --gpu)"
+        );
+        assert_eq!(
+            both.launch_note(),
+            "GPU bound: NVIDIA driver 580.65.06 via container toolkit + /dev/dri/renderD128"
+        );
+
+        // A not-yet-usable NVIDIA card is called out in status, so the user
+        // learns about it before reaching for --gpu.
+        let igpu_only = GpuAccess {
+            nvidia: None,
+            devices: vec![PathBuf::from("/dev/dri/renderD128")],
+            gids: vec![992],
+            majors: vec![226],
+        };
+        assert_eq!(
+            igpu_only.summary(&NvidiaState::DriverOnly {
+                version: "580.65.06".into()
+            }),
+            "/dev/dri/renderD128 (bound only with --gpu); NVIDIA driver 580.65.06 present \
+             but the container toolkit is missing — `arbox --gpu` explains"
+        );
+        assert_eq!(
+            GpuAccess::none().summary(&NvidiaState::HardwareOnly),
+            "none detected on host; NVIDIA GPU present but no driver loaded — `arbox --gpu` \
+             explains"
+        );
+    }
+
+    /// The NVIDIA path is a different docker mechanism entirely: `--gpus`
+    /// hands the work to the toolkit's hook, and the capability env is what
+    /// turns graphics on.
+    #[test]
+    fn gpu_apply_emits_gpus_all_for_nvidia() {
+        let access = GpuAccess {
+            nvidia: Some("580.65.06".into()),
+            devices: vec![PathBuf::from("/dev/dri/renderD128")],
+            gids: vec![992],
+            majors: vec![226],
+        };
+        let mut cmd = Command::new("docker");
+        access.apply(&mut cmd);
+        let args: Vec<String> = cmd
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            args,
+            [
+                "--gpus",
+                "all",
+                "-e",
+                "NVIDIA_DRIVER_CAPABILITIES=all",
+                "--device",
+                "/dev/dri/renderD128",
+                "--group-add",
+                "992",
+                "--device-cgroup-rule",
+                "c 226:* rmw",
+            ]
+        );
+    }
+
+    /// Each missing piece maps to one state, and each state short of Ready
+    /// carries instructions naming what to install.
+    #[test]
+    fn nvidia_state_classification_and_instructions() {
+        let v = || Some("580.65.06".to_string());
+        assert_eq!(
+            NvidiaState::classify(false, None, false),
+            NvidiaState::Absent
+        );
+        // Toolkit alone (a leftover install) with no card is still Absent.
+        assert_eq!(
+            NvidiaState::classify(false, None, true),
+            NvidiaState::Absent
+        );
+        assert_eq!(
+            NvidiaState::classify(true, None, true),
+            NvidiaState::HardwareOnly
+        );
+        assert_eq!(
+            NvidiaState::classify(true, v(), false),
+            NvidiaState::DriverOnly {
+                version: "580.65.06".into()
+            }
+        );
+        assert_eq!(
+            NvidiaState::classify(true, v(), true),
+            NvidiaState::Ready {
+                version: "580.65.06".into()
+            }
+        );
+
+        assert!(NvidiaState::Absent.instructions().is_none());
+        assert!(NvidiaState::Ready {
+            version: "580.65.06".into()
+        }
+        .instructions()
+        .is_none());
+        let hw = NvidiaState::HardwareOnly.instructions().unwrap_or_default();
+        assert!(hw.contains("ubuntu-drivers install"));
+        assert!(hw.contains("/dev/nvidiactl"));
+        let drv = NvidiaState::DriverOnly {
+            version: "580.65.06".into(),
+        }
+        .instructions()
+        .unwrap_or_default();
+        assert!(drv.contains("580.65.06"));
+        assert!(drv.contains("apt-get install -y nvidia-container-toolkit"));
+        assert!(drv.contains("nvidia-ctk runtime configure --runtime=docker"));
+        assert!(drv.contains("docker run --rm --gpus all ubuntu nvidia-smi"));
+    }
+
+    /// The install plan is the contract: NVIDIA's repo only when the distro
+    /// lacks the package, apt install always, then the documented docker
+    /// registration and restart.
+    #[test]
+    fn nvidia_toolkit_install_plan_shape() {
+        let lines = |plan: Vec<InstallStep>| -> Vec<String> {
+            plan.iter().map(InstallStep::command_line).collect()
+        };
+        let from_distro = lines(nvidia_toolkit_install_plan(true));
+        assert_eq!(
+            from_distro,
+            [
+                "sudo apt-get install -y nvidia-container-toolkit",
+                "sudo nvidia-ctk runtime configure --runtime=docker",
+                "sudo systemctl restart docker",
+            ]
+        );
+
+        let plan = nvidia_toolkit_install_plan(false);
+        assert_eq!(plan.len(), 5);
+        assert_eq!(plan[0].label, "add NVIDIA's apt repository and signing key");
+        let from_nvidia = lines(plan);
+        assert!(from_nvidia[0].starts_with("sudo sh -c curl -fsSL https://nvidia.github.io/"));
+        assert!(from_nvidia[0].contains("gpg --dearmor --yes -o /usr/share/keyrings/"));
+        assert!(from_nvidia[0].contains("signed-by=/usr/share/keyrings/"));
+        assert!(from_nvidia[0].ends_with("/etc/apt/sources.list.d/nvidia-container-toolkit.list"));
+        assert_eq!(from_nvidia[1], "sudo apt-get update");
+        assert_eq!(&from_nvidia[2..], &from_distro[..]);
+    }
+
+    /// Colour is a terminal nicety: off, the text comes through untouched.
+    #[test]
+    fn style_off_is_plain_text() {
+        let st = Style { on: false };
+        assert_eq!(st.bold("x"), "x");
+        assert_eq!(st.green("$ sudo apt-get update"), "$ sudo apt-get update");
+        let st = Style { on: true };
+        assert_eq!(st.bold("x"), "\x1b[1mx\x1b[0m");
+    }
+
+    #[test]
+    fn nvidia_driver_version_parses_proc_line() {
+        let proc_text = "NVRM version: NVIDIA UNIX Open Kernel Module for x86_64  580.65.06  \
+                         Release Build  (dvs-builder@U22-I3-AE21-05-2)  Tue Jul 22 20:40:04 UTC 2025\n\
+                         GCC version:  gcc version 13.3.0 (Ubuntu 13.3.0-6ubuntu2~24.04)\n";
+        assert_eq!(
+            nvidia_driver_version(proc_text),
+            Some("580.65.06".to_string())
+        );
+        assert_eq!(nvidia_driver_version("GCC version: 13\n"), None);
     }
 
     // Path::is_absolute has Windows semantics, and the whole audio path is
