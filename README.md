@@ -97,6 +97,12 @@ or a process that you intentionally gave access to your mounted credentials.
   local development loop needs no credential regardless: `wrangler dev`
   simulates KV, R2, D1, Durable Objects and Queues on the machine. See
   [Cloudflare / wrangler](#cloudflare--wrangler).
+- **Your GitHub login reaches the container only under `arbox gh`.** That
+  verb runs the image's `gh` against your account, so it mounts gh's config
+  dir read-write; every other verb leaves it out. The token `gh auth login`
+  stores there can read and push every repo the account can reach, so `arbox
+  claude` deliberately doesn't get it. `--mount-gh` / `--no-mount-gh`
+  override either way. See [GitHub / gh](#github--gh).
 - **USB serial devices are NOT bound unless you pass `--serial`.** With the
   flag, every `/dev/ttyUSB*` and `/dev/ttyACM*` node on the host (or just the
   ones named with `--serial-dev`) is passed through with `--device`, the
@@ -208,18 +214,20 @@ clear message.
 | `arbox [OPTIONS] bash ARGS...`  | Open an interactive login bash inside the container (args go to `bash -l`, so `arbox bash -c 'cargo test'` works). No agent state is mounted — add `--mount-<agent>` before the verb to run one from the shell. |
 | `arbox [OPTIONS] playwright ARGS...` | Run the Playwright CLI (`test`, `codegen`, `show-report`, …). Image ships Node + Playwright + chromium + firefox. No agent state is mounted. |
 | `arbox [OPTIONS] wrangler ARGS...` | Run the Cloudflare Workers CLI (`dev`, `deploy`, `d1`, …) from the image, so the host needs neither node nor wrangler. The only verb that mounts wrangler's config dir, so your `wrangler login` carries over. |
+| `arbox [OPTIONS] gh ARGS...`    | Run the GitHub CLI (`pr`, `issue`, `run`, `auth`, …) from the image. The only verb that mounts gh's config dir, so your `gh auth login` carries over and `git push` over HTTPS works via `gh auth git-credential`. |
 | `arbox [OPTIONS] run CMD...`    | Run a one-off command inside the container. No agent state is mounted. |
 | `arbox update`                  | Refresh the baked-in agents (claude, codex, opencode, agy, grok) to their latest published versions, rebuilding only the agent layers (quick — the apt/node/playwright layers stay cached). Builds the image from scratch if it doesn't exist yet. |
 | `arbox update --force`          | Full clean rebuild of the entire image (`--no-cache`): re-runs apt, node, the Playwright browser downloads, everything. |
-| `arbox status`                  | Show host facts, mount layout, image presence, network mode, whether the wrangler config dir is bound, and detected host audio and USB serial devices. Works outside a git repository (skips the workspace mount in that case). |
+| `arbox status`                  | Show host facts, mount layout, image presence, network mode, whether the wrangler and gh config dirs are bound, and detected host audio and USB serial devices. Works outside a git repository (skips the workspace mount in that case). |
 | `arbox clean`                   | Remove every arbox image whose tag has the current host's prefix. |
 
 **arbox options go before the verb. Everything after the verb belongs to the
 verb**, verbatim — arbox parses none of it, not even `--help`:
 
 ```bash
-arbox --voice --mount-codex claude --resume  # --voice/--mount-codex are arbox's; --resume is claude's
+arbox --voice --mount-gh claude --resume     # --voice/--mount-gh are arbox's; --resume is claude's
 arbox claude --help                          # claude's help, not arbox's
+arbox gh pr create --fill                    # gh sees: pr create --fill
 arbox --rw ~/scratch run cargo test          # the `--` of older docs is still accepted
 ```
 
@@ -227,7 +235,7 @@ The flip side: an arbox option written after the verb is handed to the tool
 (`arbox claude --voice` starts claude with a `--voice` argument it doesn't
 know). `arbox --help` lists every option.
 
-`claude`, `codex`, `opencode`, `agy`, `grok`, `playwright`, `wrangler`,
+`claude`, `codex`, `opencode`, `agy`, `grok`, `playwright`, `wrangler`, `gh`,
 `bash`, and `run` must be invoked from inside a git repository — they mount the git toplevel as
 the workspace and `cd` into your current directory. `status`, `update`, and
 `clean` do not require a repo.
@@ -260,11 +268,13 @@ Each tool's credentials and history live in a dot-directory on your host, and
 | `arbox agy`        | `~/.gemini`, `~/.config/antigravity` |
 | `arbox grok`       | `~/.grok` |
 | `arbox wrangler`   | wrangler's config dir (`~/.config/.wrangler` on Linux) |
+| `arbox gh`         | gh's config dir (`~/.config/gh`) |
 | `arbox bash`, `arbox run`, `arbox playwright` | none |
 
 So `arbox codex` cannot read your Claude credentials, plans, or session
-history; `arbox claude` holds no Cloudflare token; and `arbox playwright test`
-holds nothing at all. This is the default; nothing is needed to get it.
+history; `arbox claude` holds no Cloudflare or GitHub token; and `arbox
+playwright test` holds nothing at all. This is the default; nothing is needed
+to get it.
 
 Two options override it in either direction, on any verb:
 
@@ -275,11 +285,12 @@ arbox --no-mount-claude claude             # claude with throwaway state
 arbox --mount-grok run grok "summarize this diff"
 arbox --mount-wrangler bash                # shell that can deploy
 arbox --no-mount-wrangler wrangler dev     # local dev, no credential in the box
+arbox --mount-gh claude                    # claude that can open PRs and push
 ```
 
 `--mount-<name>` adds that state whatever the verb's default;
 `--no-mount-<name>` removes it, including on the tool's own verb. Both exist
-for all six: `claude`, `codex`, `opencode`, `agy`, `grok`, `wrangler`.
+for all seven: `claude`, `codex`, `opencode`, `agy`, `grok`, `wrangler`, `gh`.
 
 The consequence worth knowing: launching an agent from `arbox bash` without the
 matching flag gives you an *unauthenticated* agent that writes throwaway state
@@ -291,8 +302,8 @@ agent verb directly (`arbox claude`) needs nothing.
 `arbox status` lists **every** agent's state paths — the full map of what some
 verb could mount, so `arbox --profile NAME status` still shows you where a
 profile redirects — and spells out that any one launch mounts a subset.
-`--no-mount-<name>` subtracts from that list, `--mount-wrangler` adds the
-wrangler config dir:
+`--no-mount-<name>` subtracts from that list, `--mount-wrangler` /
+`--mount-gh` add the tool config dirs:
 
 ```
 $ arbox status
@@ -303,9 +314,11 @@ mounts (host -> container path):
 state mounts:
   each agent verb mounts only its own state (claude, codex, opencode, agy, grok);
   `arbox wrangler` mounts wrangler's config dir (your Cloudflare login);
+  `arbox gh` mounts gh's config dir (your GitHub login);
   bash, run and playwright mount none of it.
   override on any verb with --mount-<name> / --no-mount-<name>.
   wrangler config: /home/jason/.config/.wrangler (bound only with `arbox wrangler` or --mount-wrangler)
+  gh config: /home/jason/.config/gh (bound only with `arbox gh` or --mount-gh)
   (the mounts above list every agent's state — one launch mounts a subset.)
 ```
 
@@ -563,6 +576,65 @@ Unauthenticated wrangler still sends telemetry on every command. Set
 `WRANGLER_SEND_METRICS=false`, or `send_metrics = false` in the config, to turn
 that off.
 
+### GitHub / gh
+
+`arbox gh ...` runs the `gh` baked into the image against your current
+workspace:
+
+```bash
+arbox gh pr create --fill
+arbox gh pr checks
+arbox gh run watch
+```
+
+It is the only verb that mounts gh's config dir, so a `gh auth login` — on
+the host or from inside the box — carries over and persists. Every other verb
+leaves that dir out of the mount list entirely, so `arbox claude` and
+`arbox bash` hold no GitHub credential. To let an agent open PRs and push,
+say so:
+
+```bash
+arbox --mount-gh claude
+arbox --mount-gh bash
+```
+
+Understand what that shares. The OAuth token in `hosts.yml` carries the
+scopes `gh auth login` requested — by default `repo`, `read:org` and `gist` —
+which means read and push access to every repository the account can reach,
+private ones included. Anything running in *that* container can push with it.
+For a narrower credential, set `GH_TOKEN` in the container shell to a
+fine-grained personal access token scoped to the repositories at hand; gh
+prefers it over the stored login, it never lands in a file, and no mount is
+needed at all.
+
+`git push` over HTTPS works inside the box when your host `~/.gitconfig`
+(mounted read-only) names gh as the credential helper — what `gh auth setup-git`
+writes — and the config dir is mounted. SSH remotes are a separate matter:
+arbox mounts no SSH keys and no agent socket, so an SSH remote will not
+authenticate in here.
+
+The mount source follows gh's own resolution, so it is the same directory
+your host gh uses: `$GH_CONFIG_DIR` if set, else `$XDG_CONFIG_HOME/gh`, else
+`~/.config/gh` on Linux and macOS and `%AppData%\GitHub CLI` on Windows. The
+container side is always `~/.config/gh`. The directory is created on the
+first launch that mounts it so the bind mount attaches, and it is shared
+across `--profile`s.
+
+`arbox status` reports the state either way, under `state mounts:`:
+
+```
+  gh config: /home/jason/.config/gh (bound only with `arbox gh` or --mount-gh)
+```
+
+#### Logging in from inside the container
+
+`gh auth login` inside the box uses the device-code flow (there is no browser
+to open, and gh notices), prints a one-time code and a URL, and stores the
+resulting token in `hosts.yml` in the mounted config dir — the same file a
+host gh with no keyring would use, so a host that keeps its token in the
+system keyring instead will not see the container's login, and vice versa.
+Log in on whichever side you use gh from, or run `gh auth login` in both.
+
 ## Windows Quirks
 
 ### Git Worktrees
@@ -613,7 +685,7 @@ Files created inside the container will appear to be owned by UID/GID 1000 in th
    download. Only that layer's hard prerequisites precede it: an apt layer
    holding the browsers' shared libraries and fonts, then pinned Node. The
    main apt set (build tools, database clients, serial and audio userspace,
-   agent ergonomics) and the pinned uv, deno, bun, pnpm, and wrangler
+   agent ergonomics) and the pinned uv, deno, bun, pnpm, wrangler, and gh
    installs all come after (architecture chosen from BuildKit's
    `TARGETARCH`), so adding a package or bumping a tool leaves the browsers
    cached. Below that it bakes in the coding agents, mirrors the host
@@ -621,10 +693,11 @@ Files created inside the container will appear to be owned by UID/GID 1000 in th
    over the host-mounted `~/.local/bin` — while `~/.cargo/bin` stays first
    for the rustup shims.
 5. `launch::mount_specs()` builds the explicit bind-mount list for the
-   workspace, git worktree metadata, Rust toolchain, wrangler's config dir
-   and the state dirs `launch::select()` resolved for this verb — an agent
-   verb's own agent, wrangler's config dir for `arbox wrangler`, nothing for
-   `bash`/`run`/`playwright` — adjusted by any `--mount-<name>` /
+   workspace, git worktree metadata, Rust toolchain, the wrangler and gh
+   config dirs and the state dirs `launch::select()` resolved for this verb —
+   an agent verb's own agent, wrangler's config dir for `arbox wrangler`, gh's
+   for `arbox gh`, nothing for `bash`/`run`/`playwright` — adjusted by any
+   `--mount-<name>` /
    `--no-mount-<name>` flags. Agent *binaries* are never
    mounted — they come from the image. With `--profile NAME` each agent's state
    tree is instead sourced from `~/.arbox/profiles/NAME/` (see

@@ -195,11 +195,11 @@ RUN if [ "${BAKE_RUSTUP}" = "true" ]; then \
       chmod -R 777 "${CARGO_HOME}" "${RUSTUP_HOME}"; \
     fi
 
-# JS/TS package managers and the Cloudflare Workers CLI. Deliberately placed
-# BELOW the Playwright + rustup layers so adding or bumping any of these never
-# invalidates the browser download or a baked toolchain, and ABOVE the agent
-# cache-bust barrier so they stay pinned instead of moving on every
-# `arbox update`.
+# JS/TS package managers, the Cloudflare Workers CLI, and the GitHub CLI.
+# Deliberately placed BELOW the Playwright + rustup layers so adding or
+# bumping any of these never invalidates the browser download or a baked
+# toolchain, and ABOVE the agent cache-bust barrier so they stay pinned
+# instead of moving on every `arbox update`.
 
 # bun (JS runtime + npm-compatible package manager, `bun install` / `bunx`).
 # Same versioned-release pattern as uv/deno. NOTE: the plain linux-x64 build
@@ -242,12 +242,35 @@ RUN npm install -g "pnpm@${PNPM_VERSION}"
 ARG WRANGLER_VERSION=4.130.0
 RUN npm install -g "wrangler@${WRANGLER_VERSION}"
 
+# gh (GitHub CLI). Versioned tarball from GitHub releases, same pattern as
+# uv/deno/bun. Override GH_VERSION at build time to bump.
+#
+# No GitHub credential is present except under `arbox gh`, the verb that runs
+# this binary and mounts the config dir gh stores its token in (hosts.yml —
+# see the `TOOLS` table in src/launch.rs). Every other verb leaves it out. gh
+# has no keyring in here, so `arbox gh auth login` falls back to the file,
+# which is exactly what makes the mount persist it. With the config mounted,
+# a host ~/.gitconfig that names `gh auth git-credential` as the credential
+# helper makes `git push` over HTTPS work inside the box too.
+ARG GH_VERSION=2.100.0
+RUN ARCH=$(case "${TARGETARCH}" in \
+        amd64) echo amd64 ;; \
+        arm64) echo arm64 ;; \
+        *)     echo "" ;; \
+    esac) \
+ && [ -n "${ARCH}" ] || { echo "arbox: unsupported TARGETARCH=${TARGETARCH}" >&2; exit 1; } \
+ && curl -fsSL "https://github.com/cli/cli/releases/download/v${GH_VERSION}/gh_${GH_VERSION}_linux_${ARCH}.tar.gz" \
+      -o /tmp/gh.tar.gz \
+ && tar -xzf /tmp/gh.tar.gz -C /tmp \
+ && install -m 0755 "/tmp/gh_${GH_VERSION}_linux_${ARCH}/bin/gh" /usr/local/bin/gh \
+ && rm -rf /tmp/gh.tar.gz "/tmp/gh_${GH_VERSION}_linux_${ARCH}"
+
 # Cache-bust barrier for the five agent layers below. `arbox update` passes a
 # fresh value here (a unix timestamp) as a --build-arg, which invalidates this
 # layer and therefore every layer after it — the claude/codex/opencode/agy/grok
 # installs re-run and pull their latest published versions, while every
 # expensive layer ABOVE this point (apt, node, the ~700 MB Playwright browser
-# downloads, uv, deno, bun/pnpm/wrangler, the baked rustup toolchain on
+# downloads, uv, deno, bun/pnpm/wrangler/gh, the baked rustup toolchain on
 # Windows/macOS) stays cached. The default 0 keeps ordinary cached builds (the auto-bootstrap on
 # first launch, `arbox update --force`'s --no-cache pass) unaffected: the
 # agents only move when you run `arbox update`. This barrier MUST stay below

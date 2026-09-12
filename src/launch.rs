@@ -151,7 +151,7 @@ fn agent_state_paths<'a>(agents: &'a [&str]) -> impl Iterator<Item = (&'static s
 
 /// The `--mount-<name>` / `--no-mount-<name>` overrides, as given on the
 /// command line. Empty means "whatever the verb defaults to". Names are the
-/// five agents plus `wrangler`.
+/// five agents plus the tools in `TOOLS` (`wrangler`, `gh`).
 #[derive(Default, Debug)]
 pub struct MountOverrides {
     on: Vec<String>,
@@ -180,33 +180,44 @@ impl MountOverrides {
 }
 
 /// The credential-bearing state one launch mounts: which agents' trees, and
-/// whether wrangler's config dir comes along.
+/// which non-agent tools' config dirs (`TOOLS`) come along.
 pub struct Selection {
     agents: Vec<&'static str>,
-    wrangler: bool,
+    tools: Vec<&'static str>,
+}
+
+impl Selection {
+    fn has_tool(&self, name: &str) -> bool {
+        self.tools.contains(&name)
+    }
 }
 
 /// Resolve what a verb mounts: its own defaults, then the user's overrides.
 ///
 /// The defaults are deliberately narrow. An agent verb passes its own name in
-/// `agents` and nothing else; `arbox wrangler` passes `wrangler: true`; every
-/// other verb (`bash`, `run`, `playwright`) passes nothing at all. So `arbox
-/// codex` never sees your Claude credentials or session history, `arbox
-/// playwright test` sees no credentials whatsoever, and a Cloudflare token
-/// only reaches the container when you actually run wrangler.
-/// `--mount-<name>` and `--no-mount-<name>` override that in either
-/// direction, on any verb.
-fn select(agents: &[&str], wrangler: bool, ov: &MountOverrides) -> Selection {
+/// `agents` and nothing else; a tool verb (`arbox wrangler`, `arbox gh`)
+/// passes its own name in `tools`; every other verb (`bash`, `run`,
+/// `playwright`) passes nothing at all. So `arbox codex` never sees your
+/// Claude credentials or session history, `arbox playwright test` sees no
+/// credentials whatsoever, and a Cloudflare or GitHub token only reaches the
+/// container when you actually run that tool. `--mount-<name>` and
+/// `--no-mount-<name>` override that in either direction, on any verb.
+fn select(agents: &[&str], tools: &[&str], ov: &MountOverrides) -> Selection {
+    let pick = |name: &&'static str, defaults: &[&str]| {
+        ov.resolve(name)
+            .unwrap_or_else(|| defaults.iter().any(|d| d == name))
+    };
     Selection {
         agents: AGENTS
             .iter()
             .map(|a| a.name)
-            .filter(|name| {
-                ov.resolve(name)
-                    .unwrap_or_else(|| agents.iter().any(|d| d == name))
-            })
+            .filter(|name| pick(name, agents))
             .collect(),
-        wrangler: ov.resolve("wrangler").unwrap_or(wrangler),
+        tools: TOOLS
+            .iter()
+            .map(|t| t.name)
+            .filter(|name| pick(name, tools))
+            .collect(),
     }
 }
 
@@ -248,13 +259,60 @@ fn xdg_override(rel: &str, get: &dyn Fn(&str) -> Option<std::ffi::OsString>) -> 
     base.is_absolute().then(|| base.join(suffix))
 }
 
-/// Container-side location of wrangler's global config dir — the one holding
-/// the refreshable OAuth token `wrangler login` caches. Fixed, because the
-/// container is always Linux and arbox forwards no XDG vars into it, so the
-/// wrangler in the image always resolves this path under its HOME.
-const WRANGLER_CONFIG_REL: &str = ".config/.wrangler";
+/// Env lookup handed to the host-side path resolvers, so tests can feed a
+/// synthetic environment.
+type EnvGet<'a> = &'a dyn Fn(&str) -> Option<std::ffi::OsString>;
 
-/// Where that same dir lives on the HOST, which is not the same answer.
+/// A non-agent tool baked into the image whose login lives in one config dir
+/// on the host. Like an agent's state, that dir is mounted RW only by the
+/// tool's own verb (or an explicit `--mount-<name>`), because what it holds
+/// is an account-wide credential no other verb has any business with. Unlike
+/// agent state it is NOT profile-scoped — a Cloudflare or GitHub account
+/// isn't tied to an agent subscription, and both tools carry their own
+/// multi-account switching.
+struct ToolSpec {
+    /// Verb name — identical to the binary name inside the image.
+    name: &'static str,
+    /// Container-side home-relative config dir. Fixed, because the container
+    /// is always Linux and arbox forwards no XDG vars into it, so the tool in
+    /// the image always resolves this path under its HOME.
+    container_rel: &'static str,
+    /// Where that same dir lives on the HOST, following the tool's own
+    /// per-platform resolution so the mount is SHARED with a host-side
+    /// install rather than a second, silently diverging login.
+    source: fn(&Path, EnvGet) -> PathBuf,
+    /// What the credential in there is, for `arbox status` and the README.
+    credential: &'static str,
+}
+
+const TOOLS: &[ToolSpec] = &[
+    // wrangler: the refreshable OAuth token `wrangler login` caches. Account-
+    // wide and deploy-capable (workers, d1, pages, zone, ssl_certs,
+    // containers, secrets_store, …). Local development needs none of it:
+    // `wrangler dev` simulates KV, R2, D1, Durable Objects and Queues on the
+    // machine. Mounted RW because wrangler writes both its token and its logs
+    // there.
+    ToolSpec {
+        name: "wrangler",
+        container_rel: ".config/.wrangler",
+        source: wrangler_config_source,
+        credential: "your Cloudflare login",
+    },
+    // gh: `hosts.yml` holds the OAuth token `gh auth login` stores (when no
+    // system keyring is reachable — the case inside the container, and on any
+    // host where gh fell back to the file), plus `config.yml`. That token can
+    // read and push every repo the account can, open PRs, and read private
+    // repos, so `arbox claude` doesn't get it unless asked. Mounted RW so a
+    // `gh auth login` from inside persists and token refreshes stick.
+    ToolSpec {
+        name: "gh",
+        container_rel: ".config/gh",
+        source: gh_config_source,
+        credential: "your GitHub login",
+    },
+];
+
+/// Where wrangler's global config dir lives on the HOST.
 /// Wrangler resolves it through its vendored copy of `xdg-app-paths`:
 ///
 ///   - a pre-existing legacy `~/.wrangler` directory wins over everything;
@@ -290,7 +348,37 @@ fn wrangler_config_source(
             .join("xdg.config")
             .join(".wrangler")
     } else {
-        home.join(WRANGLER_CONFIG_REL)
+        home.join(".config").join(".wrangler")
+    }
+}
+
+/// Where gh's config dir lives on the HOST, following gh's own resolution
+/// (`internal/config.ConfigDir`):
+///
+///   - `$GH_CONFIG_DIR` when set;
+///   - otherwise `$XDG_CONFIG_HOME/gh` when that's set;
+///   - otherwise `%AppData%\GitHub CLI` on Windows and `~/.config/gh`
+///     everywhere else (macOS included — gh does not use ~/Library).
+fn gh_config_source(home: &Path, get: EnvGet) -> PathBuf {
+    if let Some(dir) = get("GH_CONFIG_DIR")
+        .map(PathBuf::from)
+        .filter(|p| p.is_absolute())
+    {
+        return dir;
+    }
+    if let Some(base) = get("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .filter(|p| p.is_absolute())
+    {
+        return base.join("gh");
+    }
+    if cfg!(target_family = "windows") {
+        get("APPDATA")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| home.join("AppData").join("Roaming"))
+            .join("GitHub CLI")
+    } else {
+        home.join(".config").join("gh")
     }
 }
 
@@ -363,22 +451,13 @@ pub fn mount_specs(host: &HostContext, profile: Option<&str>, sel: &Selection) -
         }
     }
 
-    // wrangler's global config dir. On for `arbox wrangler` — the whole point
-    // of that verb is running the image's wrangler against your account
-    // without installing node and wrangler on the host — and off everywhere
-    // else, because the token `wrangler login` caches there is a refreshable,
-    // account-wide, deploy-capable OAuth credential (workers, d1, pages, zone,
-    // ssl_certs, containers, secrets_store, …) that `arbox claude` has no
-    // business holding. Local development needs none of it either way:
-    // `wrangler dev` simulates KV, R2, D1, Durable Objects and Queues on the
-    // machine. Mounted RW (wrangler writes both its token and its logs there),
-    // and not profile-scoped: a Cloudflare account isn't tied to an agent
-    // subscription, and wrangler carries its own auth profiles for juggling
-    // several. The destination is the container's fixed Linux path; only the
-    // source follows the host's platform.
-    if sel.wrangler {
-        let dst = h.join(WRANGLER_CONFIG_REL);
-        let src = wrangler_config_source(h, &|var| std::env::var_os(var));
+    // Tool config dirs (wrangler, gh) for the SELECTED tools only — on for
+    // the tool's own verb, off everywhere else, per the `TOOLS` table. The
+    // destination is the container's fixed Linux path; only the source
+    // follows the host's platform. Never profile-scoped.
+    for tool in TOOLS.iter().filter(|t| sel.has_tool(t.name)) {
+        let dst = h.join(tool.container_rel);
+        let src = (tool.source)(h, &|var| std::env::var_os(var));
         specs.push(if src == dst {
             MountSpec::new(dst, false, false, None)
         } else {
@@ -481,10 +560,10 @@ fn fixup_windows_worktree(host: &HostContext) -> Result<Option<String>> {
 /// (`.claude/`, `.claude.json`, …) is identical either way, which is what
 /// lets the profile dir stand in as a self-contained agent home.
 fn ensure_state(host: &HostContext, sel: &Selection, profile: Option<&str>) -> Result<()> {
-    if sel.wrangler {
-        // Not profile-aware: `wrangler_config_source` mirrors wherever the
-        // host's own wrangler keeps its config.
-        let d = wrangler_config_source(&host.home, &|var| std::env::var_os(var));
+    for tool in TOOLS.iter().filter(|t| sel.has_tool(t.name)) {
+        // Not profile-aware: each tool's `source` mirrors wherever the host's
+        // own copy of the tool keeps its config.
+        let d = (tool.source)(&host.home, &|var| std::env::var_os(var));
         std::fs::create_dir_all(&d).with_context(|| format!("creating {}", d.display()))?;
     }
     for spec in AGENTS.iter().filter(|a| sel.agents.contains(&a.name)) {
@@ -514,7 +593,7 @@ fn ensure_state(host: &HostContext, sel: &Selection, profile: Option<&str>) -> R
 /// mounts a subset. `--no-mount-<name>` still subtracts from it.
 pub fn status_selection(ov: &MountOverrides) -> Selection {
     let all: Vec<&str> = AGENTS.iter().map(|a| a.name).collect();
-    select(&all, false, ov)
+    select(&all, &[], ov)
 }
 
 /// Every agent verb name, for the `arbox status` reminder that each mounts
@@ -523,20 +602,33 @@ pub fn agent_names() -> Vec<&'static str> {
     AGENTS.iter().map(|a| a.name).collect()
 }
 
-/// One-line `arbox status` description of the wrangler mount, in the same
-/// shape as the audio and serial summaries: what would be bound, and whether
-/// this invocation actually binds it.
-pub fn wrangler_summary(host: &HostContext, sel: &Selection) -> String {
-    let enabled = sel.wrangler;
-    let src = wrangler_config_source(&host.home, &|var| std::env::var_os(var));
-    if enabled {
-        format!("{} (rw)", src.display())
-    } else {
-        format!(
-            "{} (bound only with `arbox wrangler` or --mount-wrangler)",
-            src.display()
-        )
-    }
+/// `(verb name, credential description)` for every tool in `TOOLS`, for the
+/// `arbox status` note on what each tool verb mounts.
+pub fn tool_names() -> Vec<(&'static str, &'static str)> {
+    TOOLS.iter().map(|t| (t.name, t.credential)).collect()
+}
+
+/// One-line `arbox status` description of each tool config mount, in the
+/// same shape as the audio and serial summaries: what would be bound, and
+/// whether this invocation actually binds it. One `(name, line)` per tool.
+pub fn tool_summaries(host: &HostContext, sel: &Selection) -> Vec<(&'static str, String)> {
+    TOOLS
+        .iter()
+        .map(|t| {
+            let src = (t.source)(&host.home, &|var| std::env::var_os(var));
+            let line = if sel.has_tool(t.name) {
+                format!("{} (rw)", src.display())
+            } else {
+                format!(
+                    "{} (bound only with `arbox {}` or --mount-{})",
+                    src.display(),
+                    t.name,
+                    t.name
+                )
+            };
+            (t.name, line)
+        })
+        .collect()
 }
 
 /// Per-invocation launch options shared by every verb: the user's extra
@@ -601,7 +693,7 @@ fn run_agent(
     host::require_git(&host)?;
     // The verb's own agent is the only default — anything else has to be
     // asked for with --mount-<name>.
-    let sel = select(&[agent], false, &opts.mounts);
+    let sel = select(&[agent], &[], &opts.mounts);
     ensure_state(&host, &sel, opts.profile.as_deref())?;
     let mut argv = vec![agent.to_string()];
     argv.extend(injected.iter().map(|f| f.to_string()));
@@ -681,7 +773,7 @@ pub fn run_playwright(extra: Vec<String>, opts: Opts) -> Result<ExitCode> {
     // Dockerfile), so this works without any host-side setup.
     // Nothing credential-bearing by default: a browser test run has no use
     // for your Claude, Codex, or Cloudflare credentials.
-    let sel = select(&[], false, &opts.mounts);
+    let sel = select(&[], &[], &opts.mounts);
     ensure_state(&host, &sel, opts.profile.as_deref())?;
     let mut argv = vec!["playwright".to_string()];
     argv.extend(extra);
@@ -698,11 +790,30 @@ pub fn run_playwright(extra: Vec<String>, opts: Opts) -> Result<ExitCode> {
 /// (`wrangler dev` and friends need no credential at all — the local dev
 /// server simulates KV, R2, D1, Durable Objects and Queues on the machine).
 pub fn run_wrangler(extra: Vec<String>, opts: Opts) -> Result<ExitCode> {
+    run_tool("wrangler", extra, opts)
+}
+
+/// `arbox gh ...` — run the image's GitHub CLI against the current workspace.
+///
+/// The one verb that mounts gh's config dir by default, so a `gh auth login`
+/// — on the host or from inside the box — carries over and persists, and
+/// `git push` over HTTPS works in here when your `~/.gitconfig` names
+/// `gh auth git-credential` as the credential helper. Nothing else mounts it:
+/// the token is account-wide (every repo the account can push to), which is
+/// exactly what `arbox claude` should not be holding by default.
+pub fn run_gh(extra: Vec<String>, opts: Opts) -> Result<ExitCode> {
+    run_tool("gh", extra, opts)
+}
+
+/// Shared skeleton for the tool verbs: like `run_agent`, but the default
+/// mount is the tool's config dir from `TOOLS` and nothing is injected ahead
+/// of the user's args.
+fn run_tool(tool: &'static str, extra: Vec<String>, opts: Opts) -> Result<ExitCode> {
     let host = host::detect()?;
     host::require_git(&host)?;
-    let sel = select(&[], true, &opts.mounts);
+    let sel = select(&[], &[tool], &opts.mounts);
     ensure_state(&host, &sel, opts.profile.as_deref())?;
-    let mut argv = vec!["wrangler".to_string()];
+    let mut argv = vec![tool.to_string()];
     argv.extend(extra);
     run(host, argv, opts, &sel)
 }
@@ -715,7 +826,7 @@ pub fn run_bash(extra: Vec<String>, opts: Opts) -> Result<ExitCode> {
     // agent starts unauthenticated and writes throwaway state inside the
     // container, which is the intended shape — the shell is not a blanket
     // grant of every credential you own.
-    let sel = select(&[], false, &opts.mounts);
+    let sel = select(&[], &[], &opts.mounts);
     ensure_state(&host, &sel, opts.profile.as_deref())?;
     let mut argv = vec!["/bin/bash".to_string(), "-l".to_string()];
     argv.extend(extra);
@@ -729,7 +840,7 @@ pub fn run_argv(argv: Vec<String>, opts: Opts) -> Result<ExitCode> {
     let host = host::detect()?;
     host::require_git(&host)?;
     // Same posture as `bash`: nothing mounted unless asked for by name.
-    let sel = select(&[], false, &opts.mounts);
+    let sel = select(&[], &[], &opts.mounts);
     ensure_state(&host, &sel, opts.profile.as_deref())?;
     run(host, argv, opts, &sel)
 }
@@ -1411,7 +1522,7 @@ mod tests {
     fn all_selected() -> Selection {
         Selection {
             agents: agent_names(),
-            wrangler: false,
+            tools: Vec::new(),
         }
     }
 
@@ -1497,7 +1608,7 @@ mod tests {
     fn agent_verb_mounts_only_its_own_state() {
         // The point of the whole scheme: `arbox codex` must not carry Claude's
         // credentials or session history, and vice versa.
-        let sel = select(&["codex"], false, &MountOverrides::default());
+        let sel = select(&["codex"], &[], &MountOverrides::default());
         assert_eq!(sel.agents, vec!["codex"]);
 
         let specs = mount_specs(&fake_host(), None, &sel);
@@ -1522,7 +1633,7 @@ mod tests {
 
     #[test]
     fn non_agent_verbs_mount_no_agent_state() {
-        let sel = select(&[], false, &MountOverrides::default());
+        let sel = select(&[], &[], &MountOverrides::default());
         assert!(sel.agents.is_empty());
         let specs = mount_specs(&fake_host(), None, &sel);
         for (rel, _) in agent_state_paths(&agent_names()) {
@@ -1538,36 +1649,74 @@ mod tests {
         // --mount-claude on a verb that defaults to nothing.
         let mut ov = MountOverrides::default();
         ov.set("claude", true);
-        assert_eq!(select(&[], false, &ov).agents, vec!["claude"]);
+        assert_eq!(select(&[], &[], &ov).agents, vec!["claude"]);
 
         // --no-mount-claude on `arbox claude` itself.
         let mut ov = MountOverrides::default();
         ov.set("claude", false);
-        assert!(select(&["claude"], false, &ov).agents.is_empty());
+        assert!(select(&["claude"], &[], &ov).agents.is_empty());
 
         // Additive: the verb's own agent plus one asked for by name.
         let mut ov = MountOverrides::default();
         ov.set("codex", true);
         assert_eq!(
-            select(&["claude"], false, &ov).agents,
+            select(&["claude"], &[], &ov).agents,
             vec!["claude", "codex"]
         );
     }
 
     #[test]
-    fn wrangler_verb_default_and_overrides() {
-        // `arbox wrangler` mounts it; every other verb doesn't.
-        assert!(select(&[], true, &MountOverrides::default()).wrangler);
-        assert!(!select(&["claude"], false, &MountOverrides::default()).wrangler);
+    fn tool_verb_default_and_overrides() {
+        for tool in ["wrangler", "gh"] {
+            // The tool's own verb mounts it; every other verb doesn't — not
+            // even the other tool's verb.
+            assert!(select(&[], &[tool], &MountOverrides::default()).has_tool(tool));
+            assert!(!select(&["claude"], &[], &MountOverrides::default()).has_tool(tool));
+            let other = if tool == "gh" { "wrangler" } else { "gh" };
+            assert!(!select(&[], &[other], &MountOverrides::default()).has_tool(tool));
 
-        // --mount-wrangler turns it on elsewhere; --no-mount-wrangler turns it
-        // off on the wrangler verb itself.
-        let mut ov = MountOverrides::default();
-        ov.set("wrangler", true);
-        assert!(select(&["claude"], false, &ov).wrangler);
-        let mut ov = MountOverrides::default();
-        ov.set("wrangler", false);
-        assert!(!select(&[], true, &ov).wrangler);
+            // --mount-<tool> turns it on elsewhere; --no-mount-<tool> turns it
+            // off on the tool's own verb.
+            let mut ov = MountOverrides::default();
+            ov.set(tool, true);
+            assert!(select(&["claude"], &[], &ov).has_tool(tool));
+            let mut ov = MountOverrides::default();
+            ov.set(tool, false);
+            assert!(!select(&[], &[tool], &ov).has_tool(tool));
+        }
+    }
+
+    // gh's resolution is env-driven; pin the Unix branch (the Windows one
+    // reads %APPDATA%, and Path::is_absolute has Windows semantics).
+    #[cfg(not(target_family = "windows"))]
+    #[test]
+    fn gh_config_follows_host_resolution() {
+        use std::ffi::OsString;
+
+        let home = Path::new("/home/jason");
+
+        // Nothing set → ~/.config/gh, same as the container side.
+        assert_eq!(
+            gh_config_source(home, &|_| None),
+            PathBuf::from("/home/jason/.config/gh")
+        );
+
+        // GH_CONFIG_DIR wins outright, over XDG_CONFIG_HOME too.
+        let both = |var: &str| match var {
+            "GH_CONFIG_DIR" => Some(OsString::from("/opt/ghcfg")),
+            "XDG_CONFIG_HOME" => Some(OsString::from("/xdg/cfg")),
+            _ => None,
+        };
+        assert_eq!(gh_config_source(home, &both), PathBuf::from("/opt/ghcfg"));
+
+        // XDG_CONFIG_HOME moves it; relative values are ignored per the spec.
+        let xdg = |var: &str| (var == "XDG_CONFIG_HOME").then(|| OsString::from("/xdg/cfg"));
+        assert_eq!(gh_config_source(home, &xdg), PathBuf::from("/xdg/cfg/gh"));
+        let rel = |var: &str| (var == "XDG_CONFIG_HOME").then(|| OsString::from("cfg"));
+        assert_eq!(
+            gh_config_source(home, &rel),
+            PathBuf::from("/home/jason/.config/gh")
+        );
     }
 
     // Wrangler's own resolution is per-platform; pin the Linux branch (and the
@@ -1599,38 +1748,41 @@ mod tests {
     }
 
     #[test]
-    fn wrangler_config_is_not_mounted_by_other_verbs() {
-        // Only `arbox wrangler` (or an explicit --mount-wrangler) carries a
-        // Cloudflare credential, under a profile or otherwise.
+    fn tool_config_is_not_mounted_by_other_verbs() {
+        // Only the tool's own verb (or an explicit --mount-<tool>) carries a
+        // Cloudflare or GitHub credential, under a profile or otherwise.
         for profile in [None, Some("personal")] {
-            let sel = select(&[], false, &MountOverrides::default());
+            let sel = select(&[], &[], &MountOverrides::default());
             let specs = mount_specs(&fake_host(), profile, &sel);
-            assert!(
-                dst(&specs, "/home/jason/.config/.wrangler").is_none(),
-                "wrangler config must stay out of the mount list by default"
-            );
+            for path in ["/home/jason/.config/.wrangler", "/home/jason/.config/gh"] {
+                assert!(
+                    dst(&specs, path).is_none(),
+                    "{path} must stay out of the mount list by default"
+                );
+            }
         }
     }
 
     #[test]
-    fn wrangler_verb_mounts_at_the_container_linux_path() {
+    fn tool_verb_mounts_at_the_container_linux_path() {
         // The destination is fixed even when the host source is elsewhere
         // (macOS/Windows, an XDG override, or a legacy ~/.wrangler), and it
         // stays shared under a profile.
-        for profile in [None, Some("personal")] {
-            let sel = select(&[], true, &MountOverrides::default());
-            let specs = mount_specs(&fake_host(), profile, &sel);
-            let m = dst(&specs, "/home/jason/.config/.wrangler")
-                .expect("missing wrangler config mount");
-            assert!(!m.read_only, "wrangler must be able to write its token");
-            assert!(
-                !m.required,
-                "a host without wrangler state must still launch"
-            );
-            assert!(
-                !m.src.starts_with("/home/jason/.arbox/profiles"),
-                "wrangler config must stay shared across profiles"
-            );
+        for (tool, path) in [
+            ("wrangler", "/home/jason/.config/.wrangler"),
+            ("gh", "/home/jason/.config/gh"),
+        ] {
+            for profile in [None, Some("personal")] {
+                let sel = select(&[], &[tool], &MountOverrides::default());
+                let specs = mount_specs(&fake_host(), profile, &sel);
+                let m = dst(&specs, path).unwrap_or_else(|| panic!("missing {tool} config mount"));
+                assert!(!m.read_only, "{tool} must be able to write its token");
+                assert!(!m.required, "a host without {tool} state must still launch");
+                assert!(
+                    !m.src.starts_with("/home/jason/.arbox/profiles"),
+                    "{tool} config must stay shared across profiles"
+                );
+            }
         }
     }
 

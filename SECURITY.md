@@ -47,7 +47,8 @@ paths. The threat model and what's in/out of scope is documented in the
   compromised agent modifying the mounted project, `~/.cargo`, or any of the
   read-write agent state mounts (`~/.claude`, `~/.claude.json`, `~/.codex`,
   `~/.config/opencode`, `~/.local/share/opencode`, `~/.gemini`,
-  `~/.config/antigravity`, `~/.grok`).
+  `~/.config/antigravity`, `~/.grok`, and the wrangler and gh config dirs
+  under their own verbs or `--mount-<tool>`).
 - Clipboard access through the documented Wayland socket mount when the host
   has a Wayland session.
 - Anything that requires the attacker to already have host shell.

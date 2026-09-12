@@ -5,13 +5,12 @@ use std::process::ExitCode;
 
 use arbox::{image, launch};
 
-/// Every arbox option goes BEFORE the verb: `arbox --voice --mount-codex
-/// claude --resume`. Everything after the verb is the verb's own command line
-/// and is forwarded to it verbatim — arbox parses none of it, not even
-/// `--help`. That is what makes `arbox claude --help` show claude's help and
-/// `arbox wrangler d1 list` mean what it says, at the cost of arbox flags
-/// after the verb no longer working: `arbox claude --voice` hands `--voice`
-/// to claude.
+/// Every arbox option goes BEFORE the verb: `arbox --voice --mount-gh claude
+/// --resume`. Everything after the verb is the verb's own command line and is
+/// forwarded to it verbatim — arbox parses none of it, not even `--help`.
+/// That is what makes `arbox claude --help` show claude's help and `arbox gh
+/// pr create --fill` mean what it says, at the cost of arbox flags after the
+/// verb no longer working: `arbox claude --voice` hands `--voice` to claude.
 #[derive(Parser, Debug)]
 #[command(
     name = "arbox",
@@ -21,7 +20,7 @@ use arbox::{image, launch};
                   arbox options go before the verb; everything after the verb is \
                   passed to it verbatim:\n\n    \
                   arbox [OPTIONS] claude [CLAUDE ARGS...]\n    \
-                  arbox --voice --mount-codex claude --resume\n    \
+                  arbox --voice --mount-gh claude --resume\n    \
                   arbox --rw ~/scratch run cargo test"
 )]
 struct Cli {
@@ -121,6 +120,16 @@ struct Cli {
     /// it simulates KV, R2, D1, Durable Objects and Queues on the machine.
     #[arg(long = "no-mount-wrangler", conflicts_with = "mount_wrangler")]
     no_mount_wrangler: bool,
+
+    /// Mount gh's config dir — the host's GitHub login —, whatever
+    /// the verb's default. On by default for `arbox gh`, off for every other
+    /// verb.
+    #[arg(long = "mount-gh")]
+    mount_gh: bool,
+
+    /// Leave gh's config dir unmounted, even on `arbox gh`.
+    #[arg(long = "no-mount-gh", conflicts_with = "mount_gh")]
+    no_mount_gh: bool,
 
     /// Use a named auth profile. Sources each agent's ENTIRE state
     /// tree (auth + history + memories + sessions + settings) from
@@ -229,6 +238,19 @@ enum Cmd {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
+    /// Run the GitHub CLI: `arbox gh pr create`.
+    ///
+    /// Runs the gh baked into the image against the current workspace. This
+    /// verb — and only this verb — mounts gh's config dir, so your `gh auth
+    /// login` carries over and persists, and `git push` over HTTPS works
+    /// when your ~/.gitconfig uses `gh auth git-credential`. Everything after
+    /// `gh` is forwarded verbatim. Log in from inside with `arbox gh auth
+    /// login` (the device-code flow; there is no browser in the box).
+    #[command(disable_help_flag = true)]
+    Gh {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
     /// Run an arbitrary command: `arbox run cargo test`.
     ///
     /// Everything after `run` is the command line, verbatim.
@@ -303,6 +325,7 @@ fn main() -> ExitCode {
         ("agy", cli.mount_agy, cli.no_mount_agy),
         ("grok", cli.mount_grok, cli.no_mount_grok),
         ("wrangler", cli.mount_wrangler, cli.no_mount_wrangler),
+        ("gh", cli.mount_gh, cli.no_mount_gh),
     ] {
         if on || off {
             mounts.set(name, on);
@@ -335,6 +358,7 @@ fn dispatch(cmd: Cmd, opts: launch::Opts) -> Result<ExitCode> {
         Cmd::Bash { args } => launch::run_bash(args, opts),
         Cmd::Playwright { args } => launch::run_playwright(args, opts),
         Cmd::Wrangler { args } => launch::run_wrangler(args, opts),
+        Cmd::Gh { args } => launch::run_gh(args, opts),
         Cmd::Run { cmd } => launch::run_argv(cmd, opts),
         Cmd::Update { force } => image::update_image(force).map(|_| ExitCode::SUCCESS),
         Cmd::Status => {
@@ -362,7 +386,8 @@ mod tests {
             | Cmd::Grok { args }
             | Cmd::Bash { args }
             | Cmd::Playwright { args }
-            | Cmd::Wrangler { args } => args,
+            | Cmd::Wrangler { args }
+            | Cmd::Gh { args } => args,
             Cmd::Run { cmd } => cmd,
             other => panic!("not a pass-through verb: {other:?}"),
         }
@@ -372,9 +397,9 @@ mod tests {
     /// verb — flags, `--help`, arbox's own option names — belongs to the verb.
     #[test]
     fn options_before_verb_and_verbatim_after() {
-        let cli = parse(&["--voice", "--mount-codex", "claude", "--resume", "--voice"]);
+        let cli = parse(&["--voice", "--mount-gh", "claude", "--resume", "--voice"]);
         assert!(cli.voice);
-        assert!(cli.mount_codex);
+        assert!(cli.mount_gh);
         assert_eq!(passthrough(cli.cmd), ["--resume", "--voice"]);
 
         // An arbox option after the verb is NOT an arbox option any more.
@@ -384,6 +409,11 @@ mod tests {
 
         // `--help` after a pass-through verb goes to the tool, not to clap.
         assert_eq!(passthrough(parse(&["claude", "--help"]).cmd), ["--help"]);
+        assert_eq!(passthrough(parse(&["gh", "-h"]).cmd), ["-h"]);
+        assert_eq!(
+            passthrough(parse(&["gh", "pr", "create", "--fill"]).cmd),
+            ["pr", "create", "--fill"]
+        );
         assert_eq!(
             passthrough(parse(&["bash", "-c", "cargo test"]).cmd),
             ["-c", "cargo test"]

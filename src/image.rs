@@ -297,13 +297,14 @@ pub fn print_status(profile: Option<&str>, mounts: &crate::launch::MountOverride
         "  each agent verb mounts only its own state ({});",
         agents_note()
     );
-    println!("  `arbox wrangler` mounts wrangler's config dir (your Cloudflare login);");
+    for (name, credential) in crate::launch::tool_names() {
+        println!("  `arbox {name}` mounts {name}'s config dir ({credential});");
+    }
     println!("  bash, run and playwright mount none of it.");
     println!("  override on any verb with --mount-<name> / --no-mount-<name>.");
-    println!(
-        "  wrangler config: {}",
-        crate::launch::wrangler_summary(&host, &sel)
-    );
+    for (name, line) in crate::launch::tool_summaries(&host, &sel) {
+        println!("  {name} config: {line}");
+    }
     println!("  (the mounts above list every agent's state — one launch mounts a subset.)");
 
     let t = tag(&host);
