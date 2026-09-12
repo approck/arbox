@@ -246,7 +246,7 @@ verb**, verbatim — arbox parses none of it, not even `--help`:
 arbox --voice --mount-gh claude --resume     # --voice/--mount-gh are arbox's; --resume is claude's
 arbox claude --help                          # claude's help, not arbox's
 arbox gh pr create --fill                    # gh sees: pr create --fill
-arbox --rw ~/scratch run cargo test          # the `--` of older docs is still accepted
+arbox --rw ~/scratch run -- cargo test       # the `--` of older docs is still accepted
 ```
 
 The flip side: an arbox option written after the verb is handed to the tool

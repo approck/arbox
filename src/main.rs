@@ -137,9 +137,9 @@ struct Cli {
     #[arg(long = "no-mount-grok", conflicts_with = "mount_grok")]
     no_mount_grok: bool,
 
-    /// Mount wrangler's global config dir — the host's Cloudflare login —
-    ///, whatever the verb's default. On by default for
-    /// `arbox wrangler`, off for every other verb.
+    /// Mount wrangler's global config dir (the host's Cloudflare login),
+    /// whatever the verb's default. On by default for `arbox wrangler`, off
+    /// for every other verb.
     #[arg(long = "mount-wrangler")]
     mount_wrangler: bool,
 
@@ -149,9 +149,8 @@ struct Cli {
     #[arg(long = "no-mount-wrangler", conflicts_with = "mount_wrangler")]
     no_mount_wrangler: bool,
 
-    /// Mount gh's config dir — the host's GitHub login —, whatever
-    /// the verb's default. On by default for `arbox gh`, off for every other
-    /// verb.
+    /// Mount gh's config dir (the host's GitHub login), whatever the verb's
+    /// default. On by default for `arbox gh`, off for every other verb.
     #[arg(long = "mount-gh")]
     mount_gh: bool,
 

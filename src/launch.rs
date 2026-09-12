@@ -869,7 +869,7 @@ fn run(host: HostContext, argv: Vec<String>, opts: Opts, sel: &Selection) -> Res
     };
     let gpu = opts.gpu.then(|| require_gpu(&host)).transpose()?;
     if let Some(serial) = &serial {
-        // stderr, so `arbox run -- foo | bar` pipelines stay clean.
+        // stderr, so `arbox run foo | bar` pipelines stay clean.
         eprintln!("arbox: {}", serial.launch_note());
     }
     if let Some(gpu) = &gpu {
@@ -886,7 +886,7 @@ fn run(host: HostContext, argv: Vec<String>, opts: Opts, sel: &Selection) -> Res
     cmd.args(["run", "--rm"]);
     // `-i` keeps stdin attached (needed for both interactive shells and piped
     // input). `-t` only when stdin is a real TTY — otherwise docker errors
-    // with "input device is not a TTY" under `arbox run -- foo | bar`, hooks,
+    // with "input device is not a TTY" under `arbox run foo | bar`, hooks,
     // CI, etc.
     cmd.arg("-i");
     if std::io::stdin().is_terminal() {
@@ -1493,6 +1493,8 @@ impl Style {
 /// `apt-cache policy` prints `Candidate: (none)` for a known-but-unavailable
 /// name and nothing useful for an unknown one; only a real version counts.
 fn apt_has_candidate(package: &str) -> bool {
+    // A missing or failing apt-cache is treated as "no candidate": the plan
+    // then adds NVIDIA's repository, which is the safe direction to be wrong.
     Command::new("apt-cache")
         .args(["policy", package])
         .output()
@@ -1763,6 +1765,8 @@ pub fn probe_nvidia() -> NvidiaState {
     }
     let driver_version = if is_char_device(Path::new("/dev/nvidiactl")) {
         // "NVRM version: NVIDIA UNIX Open Kernel Module for x86_64  580.65.06  Release Build …"
+        // An unreadable procfs entry still means the driver is loaded (the
+        // device node above proves it); only the version label degrades.
         std::fs::read_to_string("/proc/driver/nvidia/version")
             .ok()
             .and_then(|s| nvidia_driver_version(&s))
