@@ -1,5 +1,5 @@
 use anyhow::Result;
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, Parser, Subcommand};
 use std::path::PathBuf;
 use std::process::ExitCode;
 
@@ -318,6 +318,90 @@ enum Cmd {
     Clean,
 }
 
+impl Cmd {
+    /// The verb name and its verbatim pass-through args, for the verbs
+    /// that forward a command line.
+    fn passthrough(&self) -> Option<(&'static str, &[String])> {
+        Some(match self {
+            Cmd::Claude { args } => ("claude", args),
+            Cmd::Codex { args } => ("codex", args),
+            Cmd::Opencode { args } => ("opencode", args),
+            Cmd::Agy { args } => ("agy", args),
+            Cmd::Grok { args } => ("grok", args),
+            Cmd::Bash { args } => ("bash", args),
+            Cmd::Playwright { args } => ("playwright", args),
+            Cmd::Wrangler { args } => ("wrangler", args),
+            Cmd::Gh { args } => ("gh", args),
+            Cmd::Run { cmd } => ("run", cmd),
+            Cmd::Update { .. } | Cmd::InstallNvidiaContainerToolkit | Cmd::Status | Cmd::Clean => {
+                return None
+            }
+        })
+    }
+}
+
+/// Every long option arbox itself accepts, as `--name`, straight from clap so
+/// the list can't drift from the real flags.
+fn arbox_option_names() -> Vec<String> {
+    Cli::command()
+        .get_arguments()
+        .filter_map(|a| a.get_long())
+        .filter(|l| *l != "help" && *l != "version")
+        .map(|l| format!("--{l}"))
+        .collect()
+}
+
+/// Pass-through args that spell one of arbox's own options (`--voice`,
+/// `--rw=path`, …). Everything after the verb belongs to the tool, so this
+/// only feeds a warning: codex and wrangler have a `--profile` of their own,
+/// and `run` wraps anything at all. A `--` ends the scan, since after it the
+/// user has said explicitly that the rest is the tool's.
+fn misplaced_options(args: &[String], arbox_options: &[String]) -> Vec<String> {
+    args.iter()
+        .take_while(|a| *a != "--")
+        .filter(|a| {
+            arbox_options.iter().any(|o| {
+                a.as_str() == o
+                    || a.strip_prefix(o.as_str())
+                        .is_some_and(|rest| rest.starts_with('='))
+            })
+        })
+        .cloned()
+        .collect()
+}
+
+/// Warn, on stderr and in colour, when an arbox option sits after the verb —
+/// the tool is about to reject it (or worse, accept it as its own), and the
+/// one-line "unknown option" that follows would not say why.
+fn warn_misplaced_options(cmd: &Cmd) {
+    let Some((verb, args)) = cmd.passthrough() else {
+        return;
+    };
+    let found = misplaced_options(args, &arbox_option_names());
+    if found.is_empty() {
+        return;
+    }
+    let st = launch::Style::detect();
+    for opt in &found {
+        eprintln!(
+            "{}",
+            st.yellow(&format!(
+                "arbox: warning: `{opt}` comes after `{verb}`, so it is passed to {verb}, not \
+                 handled by arbox."
+            ))
+        );
+    }
+    eprintln!(
+        "{}",
+        st.yellow(&format!(
+            "arbox: warning: arbox options go before the verb: `arbox {} {verb} ...`. Ignore \
+             this if {verb} really takes {}.",
+            found.join(" "),
+            found.join(" ")
+        ))
+    );
+}
+
 fn main() -> ExitCode {
     if std::env::var_os("ARBOX_INSIDE").is_some() {
         eprintln!("arbox is the host-side orchestrator; it cannot run inside its own container.");
@@ -383,6 +467,7 @@ fn main() -> ExitCode {
         gpu: cli.gpu,
         mounts,
     };
+    warn_misplaced_options(&cli.cmd);
     match dispatch(cli.cmd, opts) {
         Ok(code) => code,
         Err(e) => {
@@ -423,19 +508,10 @@ mod tests {
     }
 
     fn passthrough(cmd: Cmd) -> Vec<String> {
-        match cmd {
-            Cmd::Claude { args }
-            | Cmd::Codex { args }
-            | Cmd::Opencode { args }
-            | Cmd::Agy { args }
-            | Cmd::Grok { args }
-            | Cmd::Bash { args }
-            | Cmd::Playwright { args }
-            | Cmd::Wrangler { args }
-            | Cmd::Gh { args } => args,
-            Cmd::Run { cmd } => cmd,
-            other => panic!("not a pass-through verb: {other:?}"),
-        }
+        cmd.passthrough()
+            .unwrap_or_else(|| panic!("not a pass-through verb: {cmd:?}"))
+            .1
+            .to_vec()
     }
 
     /// The contract: arbox options before the verb, and everything after the
@@ -467,6 +543,31 @@ mod tests {
             passthrough(parse(&["run", "cargo", "test", "--", "--nocapture"]).cmd),
             ["cargo", "test", "--", "--nocapture"]
         );
+    }
+
+    /// An arbox option after the verb is the tool's problem, but arbox says
+    /// so first. Only spelled-out arbox options count, `--x=v` included, and
+    /// nothing after a `--`.
+    #[test]
+    fn misplaced_arbox_options_are_spotted() {
+        let names = arbox_option_names();
+        assert!(names.contains(&"--voice".to_string()));
+        assert!(names.contains(&"--mount-gh".to_string()));
+        assert!(!names.contains(&"--help".to_string()));
+
+        let args = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            misplaced_options(&args(&["--resume", "--voice", "--rw=/x"]), &names),
+            ["--voice", "--rw=/x"]
+        );
+        // `--voicemail` is not `--voice`; a bare value is not an option.
+        assert!(misplaced_options(&args(&["--voicemail", "voice", "-v"]), &names).is_empty());
+        // After `--` the user has said whose args these are.
+        assert_eq!(
+            misplaced_options(&args(&["--gpu", "--", "--voice"]), &names),
+            ["--gpu"]
+        );
+        assert!(parse(&["status"]).cmd.passthrough().is_none());
     }
 
     /// A leading `--` right after the verb is still accepted (older docs and

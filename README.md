@@ -251,7 +251,11 @@ arbox --rw ~/scratch run cargo test          # the `--` of older docs is still a
 
 The flip side: an arbox option written after the verb is handed to the tool
 (`arbox claude --voice` starts claude with a `--voice` argument it doesn't
-know). `arbox --help` lists every option.
+know). arbox spots that and prints a warning on stderr before launching —
+`arbox: warning: `--voice` comes after `claude`, so it is passed to claude…` —
+so the tool's own "unknown option" error has an explanation next to it. It is
+only a warning: codex and wrangler have a `--profile` of their own, and `run`
+can wrap anything. `arbox --help` lists every option.
 
 `claude`, `codex`, `opencode`, `agy`, `grok`, `playwright`, `wrangler`, `gh`,
 `bash`, and `run` must be invoked from inside a git repository — they mount the git toplevel as

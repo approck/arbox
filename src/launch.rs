@@ -1427,12 +1427,12 @@ fn nvidia_toolkit_install_plan(distro_has_package: bool) -> Vec<InstallStep> {
 /// Minimal ANSI styling for arbox's own terminal output. Colour only when
 /// stderr is a terminal and the usual opt-outs (`NO_COLOR`, `TERM=dumb`) are
 /// absent, so logs and pipes see plain text. No crate: four escape codes.
-struct Style {
+pub struct Style {
     on: bool,
 }
 
 impl Style {
-    fn detect() -> Self {
+    pub fn detect() -> Self {
         let on = std::io::stderr().is_terminal()
             && std::env::var_os("NO_COLOR").is_none()
             && std::env::var_os("TERM").is_none_or(|t| t != "dumb");
@@ -1459,7 +1459,7 @@ impl Style {
         self.paint("1;32", text)
     }
 
-    fn yellow(&self, text: &str) -> String {
+    pub fn yellow(&self, text: &str) -> String {
         self.paint("33", text)
     }
 
