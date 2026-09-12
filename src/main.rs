@@ -5,51 +5,64 @@ use std::process::ExitCode;
 
 use arbox::{image, launch};
 
+/// Every arbox option goes BEFORE the verb: `arbox --voice --mount-codex
+/// claude --resume`. Everything after the verb is the verb's own command line
+/// and is forwarded to it verbatim — arbox parses none of it, not even
+/// `--help`. That is what makes `arbox claude --help` show claude's help and
+/// `arbox wrangler d1 list` mean what it says, at the cost of arbox flags
+/// after the verb no longer working: `arbox claude --voice` hands `--voice`
+/// to claude.
 #[derive(Parser, Debug)]
 #[command(
     name = "arbox",
     version,
-    about = "Docker-based agent sandbox: a skinny chroot of the host"
+    about = "Docker-based agent sandbox: a skinny chroot of the host",
+    long_about = "Docker-based agent sandbox: a skinny chroot of the host.\n\n\
+                  arbox options go before the verb; everything after the verb is \
+                  passed to it verbatim:\n\n    \
+                  arbox [OPTIONS] claude [CLAUDE ARGS...]\n    \
+                  arbox --voice --mount-codex claude --resume\n    \
+                  arbox --rw ~/scratch run cargo test"
 )]
 struct Cli {
-    /// Mount HOST_PATH read-write (repeatable, global).
-    #[arg(long = "rw", value_name = "PATH", global = true)]
+    /// Mount HOST_PATH read-write (repeatable).
+    #[arg(long = "rw", value_name = "PATH")]
     rw: Vec<PathBuf>,
 
-    /// Mount HOST_PATH read-only (repeatable, global).
-    #[arg(long = "ro", value_name = "PATH", global = true)]
+    /// Mount HOST_PATH read-only (repeatable).
+    #[arg(long = "ro", value_name = "PATH")]
     ro: Vec<PathBuf>,
 
     /// Shortcut for --rw $HOME/Desktop (fails if missing).
-    #[arg(long = "desktop", global = true)]
+    #[arg(long = "desktop")]
     desktop: bool,
 
     /// Shortcut for --rw $HOME/Downloads (fails if missing).
-    #[arg(long = "downloads", global = true)]
+    #[arg(long = "downloads")]
     downloads: bool,
 
-    /// Bind the host's sound hardware into the container (global): the
+    /// Bind the host's sound hardware into the container: the
     /// PulseAudio/PipeWire socket and/or the ALSA devices under /dev/snd.
     /// Off by default; fails if the host has no audio to bind. Linux only.
     ///
     /// For `arbox claude` this also turns Claude Code's voice mode on for the
     /// session (via --settings), so push-to-talk works without running /voice
     /// first and without editing your host settings.json.
-    #[arg(long = "voice", global = true)]
+    #[arg(long = "voice")]
     voice: bool,
 
-    /// Bind the host's USB serial devices into the container (global):
+    /// Bind the host's USB serial devices into the container:
     /// every /dev/ttyUSB* and /dev/ttyACM* node, with the owning group
     /// re-added so they're openable. For flashing and monitoring dev boards
     /// (ESP32 etc.) with espflash/esptool from inside the sandbox. Off by
     /// default; fails if the host has no such device. Linux only.
-    #[arg(long = "serial", global = true)]
+    #[arg(long = "serial")]
     serial: bool,
 
     /// Bind one specific serial device instead of every USB serial node
-    /// (repeatable, global; implies --serial). Accepts the real node or a
+    /// (repeatable; implies --serial). Accepts the real node or a
     /// /dev/serial/by-id/... symlink.
-    #[arg(long = "serial-dev", value_name = "DEV", global = true)]
+    #[arg(long = "serial-dev", value_name = "DEV")]
     serial_dev: Vec<PathBuf>,
 
     // Per-agent state mounts. Each agent verb mounts its OWN state and
@@ -57,77 +70,65 @@ struct Cli {
     // `arbox codex` cannot read your Claude credentials or session history,
     // and `arbox bash` starts with no agent credentials at all. These flags
     // override that in either direction, on any verb.
-    /// Mount Claude Code's `~/.claude` + `~/.claude.json` (global), whatever the verb's default.
-    #[arg(long = "mount-claude", global = true)]
+    /// Mount Claude Code's `~/.claude` + `~/.claude.json`, whatever the verb's default.
+    #[arg(long = "mount-claude")]
     mount_claude: bool,
 
-    /// Leave Claude Code's `~/.claude` + `~/.claude.json` unmounted (global), even on `arbox claude`.
-    #[arg(
-        long = "no-mount-claude",
-        global = true,
-        conflicts_with = "mount_claude"
-    )]
+    /// Leave Claude Code's `~/.claude` + `~/.claude.json` unmounted, even on `arbox claude`.
+    #[arg(long = "no-mount-claude", conflicts_with = "mount_claude")]
     no_mount_claude: bool,
 
-    /// Mount Codex CLI's `~/.codex` (global), whatever the verb's default.
-    #[arg(long = "mount-codex", global = true)]
+    /// Mount Codex CLI's `~/.codex`, whatever the verb's default.
+    #[arg(long = "mount-codex")]
     mount_codex: bool,
 
-    /// Leave Codex CLI's `~/.codex` unmounted (global), even on `arbox codex`.
-    #[arg(long = "no-mount-codex", global = true, conflicts_with = "mount_codex")]
+    /// Leave Codex CLI's `~/.codex` unmounted, even on `arbox codex`.
+    #[arg(long = "no-mount-codex", conflicts_with = "mount_codex")]
     no_mount_codex: bool,
 
-    /// Mount OpenCode's `~/.config/opencode` + `~/.local/share/opencode` (global), whatever the verb's default.
-    #[arg(long = "mount-opencode", global = true)]
+    /// Mount OpenCode's `~/.config/opencode` + `~/.local/share/opencode`, whatever the verb's default.
+    #[arg(long = "mount-opencode")]
     mount_opencode: bool,
 
-    /// Leave OpenCode's `~/.config/opencode` + `~/.local/share/opencode` unmounted (global), even on `arbox opencode`.
-    #[arg(
-        long = "no-mount-opencode",
-        global = true,
-        conflicts_with = "mount_opencode"
-    )]
+    /// Leave OpenCode's `~/.config/opencode` + `~/.local/share/opencode` unmounted, even on `arbox opencode`.
+    #[arg(long = "no-mount-opencode", conflicts_with = "mount_opencode")]
     no_mount_opencode: bool,
 
-    /// Mount Antigravity's `~/.gemini` + `~/.config/antigravity` (global), whatever the verb's default.
-    #[arg(long = "mount-agy", global = true)]
+    /// Mount Antigravity's `~/.gemini` + `~/.config/antigravity`, whatever the verb's default.
+    #[arg(long = "mount-agy")]
     mount_agy: bool,
 
-    /// Leave Antigravity's `~/.gemini` + `~/.config/antigravity` unmounted (global), even on `arbox agy`.
-    #[arg(long = "no-mount-agy", global = true, conflicts_with = "mount_agy")]
+    /// Leave Antigravity's `~/.gemini` + `~/.config/antigravity` unmounted, even on `arbox agy`.
+    #[arg(long = "no-mount-agy", conflicts_with = "mount_agy")]
     no_mount_agy: bool,
 
-    /// Mount Grok Build's `~/.grok` (global), whatever the verb's default.
-    #[arg(long = "mount-grok", global = true)]
+    /// Mount Grok Build's `~/.grok`, whatever the verb's default.
+    #[arg(long = "mount-grok")]
     mount_grok: bool,
 
-    /// Leave Grok Build's `~/.grok` unmounted (global), even on `arbox grok`.
-    #[arg(long = "no-mount-grok", global = true, conflicts_with = "mount_grok")]
+    /// Leave Grok Build's `~/.grok` unmounted, even on `arbox grok`.
+    #[arg(long = "no-mount-grok", conflicts_with = "mount_grok")]
     no_mount_grok: bool,
 
     /// Mount wrangler's global config dir — the host's Cloudflare login —
-    /// (global), whatever the verb's default. On by default for
+    ///, whatever the verb's default. On by default for
     /// `arbox wrangler`, off for every other verb.
-    #[arg(long = "mount-wrangler", global = true)]
+    #[arg(long = "mount-wrangler")]
     mount_wrangler: bool,
 
-    /// Leave wrangler's global config dir unmounted (global), even on
+    /// Leave wrangler's global config dir unmounted, even on
     /// `arbox wrangler`. The local dev server needs no Cloudflare credential:
     /// it simulates KV, R2, D1, Durable Objects and Queues on the machine.
-    #[arg(
-        long = "no-mount-wrangler",
-        global = true,
-        conflicts_with = "mount_wrangler"
-    )]
+    #[arg(long = "no-mount-wrangler", conflicts_with = "mount_wrangler")]
     no_mount_wrangler: bool,
 
-    /// Use a named auth profile (global). Sources each agent's ENTIRE state
+    /// Use a named auth profile. Sources each agent's ENTIRE state
     /// tree (auth + history + memories + sessions + settings) from
     /// `~/.arbox/profiles/NAME/` instead of the standard host locations, so a
     /// second subscription runs fully self-contained and never touches your
     /// default login. Auth and history always match because they live in one
     /// tree. The default (no --profile) shares your normal host locations.
-    #[arg(long = "profile", value_name = "NAME", global = true)]
+    #[arg(long = "profile", value_name = "NAME")]
     profile: Option<String>,
 
     #[command(subcommand)]
@@ -138,17 +139,19 @@ struct Cli {
 enum Cmd {
     /// Run Claude Code (--dangerously-skip-permissions injected).
     ///
-    /// All trailing args are forwarded to claude:
+    /// Everything after `claude` is forwarded to claude verbatim:
     ///   `arbox claude --resume`, `arbox claude "describe this repo"`.
-    /// With --voice, claude also starts with voice mode enabled.
+    /// With `arbox --voice claude`, claude also starts with voice mode enabled.
+    #[command(disable_help_flag = true)]
     Claude {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
     /// Run Codex CLI (approval-bypass flag injected).
     ///
-    /// Passes --dangerously-bypass-approvals-and-sandbox. All trailing args
-    /// are forwarded to codex.
+    /// Passes --dangerously-bypass-approvals-and-sandbox. Everything after
+    /// `codex` is forwarded to codex verbatim.
+    #[command(disable_help_flag = true)]
     Codex {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
@@ -161,7 +164,9 @@ enum Cmd {
     /// opencode defaults to permissive permissions. Host-local providers
     /// (e.g. Ollama on localhost:11434) work on Linux via host networking;
     /// on Windows, Docker Desktop reaches them only with its opt-in
-    /// host-networking feature enabled. All trailing args forwarded.
+    /// host-networking feature enabled. Everything after `opencode` is
+    /// forwarded verbatim.
+    #[command(disable_help_flag = true)]
     Opencode {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
@@ -171,8 +176,9 @@ enum Cmd {
     /// The binary is baked into the image; ~/.gemini and
     /// ~/.config/antigravity mount from the host for credential / skill /
     /// MCP persistence. First-time auth uses agy's SSH-style URL+code flow
-    /// because libsecret isn't available inside the container. All
-    /// trailing args forwarded.
+    /// because libsecret isn't available inside the container. Everything
+    /// after `agy` is forwarded verbatim.
+    #[command(disable_help_flag = true)]
     Agy {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
@@ -180,21 +186,31 @@ enum Cmd {
     /// Run xAI's Grok Build (`grok`) CLI.
     ///
     /// The binary is baked into the image; ~/.grok mounts from the host
-    /// for auth (token in ~/.grok/auth.json) and download cache. All
-    /// trailing args forwarded — grok's safety story is plan-mode review,
-    /// not an approval-bypass flag.
+    /// for auth (token in ~/.grok/auth.json) and download cache. Everything
+    /// after `grok` is forwarded verbatim — grok's safety story is plan-mode
+    /// review, not an approval-bypass flag.
+    #[command(disable_help_flag = true)]
     Grok {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
     /// Interactive bash login shell inside the sandbox.
-    Bash,
+    ///
+    /// Everything after `bash` is forwarded to `bash -l` verbatim:
+    /// `arbox bash -c 'cargo test'`.
+    #[command(disable_help_flag = true)]
+    Bash {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
     /// Run the Playwright CLI (test, codegen, show-report, …).
     ///
     /// Image ships node + playwright + chromium + firefox + the system
     /// libs they link against. Examples: `arbox playwright test`,
     /// `arbox playwright codegen https://example.com`,
-    /// `arbox playwright show-report`.
+    /// `arbox playwright show-report`. Everything after `playwright` is
+    /// forwarded verbatim.
+    #[command(disable_help_flag = true)]
     Playwright {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
@@ -206,13 +222,17 @@ enum Cmd {
     /// only this verb — mounts wrangler's config dir, so your `wrangler login`
     /// carries over and persists. `wrangler dev` itself needs no Cloudflare
     /// credential: it runs the Worker locally in workerd with KV, R2, D1,
-    /// Durable Objects and Queues simulated on the machine. All trailing args
-    /// are forwarded.
+    /// Durable Objects and Queues simulated on the machine. Everything after
+    /// `wrangler` is forwarded verbatim.
+    #[command(disable_help_flag = true)]
     Wrangler {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
-    /// Run an arbitrary command: `arbox run -- cargo test`.
+    /// Run an arbitrary command: `arbox run cargo test`.
+    ///
+    /// Everything after `run` is the command line, verbatim.
+    #[command(disable_help_flag = true)]
     Run {
         #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
         cmd: Vec<String>,
@@ -312,7 +332,7 @@ fn dispatch(cmd: Cmd, opts: launch::Opts) -> Result<ExitCode> {
         Cmd::Opencode { args } => launch::run_opencode(args, opts),
         Cmd::Agy { args } => launch::run_agy(args, opts),
         Cmd::Grok { args } => launch::run_grok(args, opts),
-        Cmd::Bash => launch::run_bash(opts),
+        Cmd::Bash { args } => launch::run_bash(args, opts),
         Cmd::Playwright { args } => launch::run_playwright(args, opts),
         Cmd::Wrangler { args } => launch::run_wrangler(args, opts),
         Cmd::Run { cmd } => launch::run_argv(cmd, opts),
@@ -321,5 +341,87 @@ fn dispatch(cmd: Cmd, opts: launch::Opts) -> Result<ExitCode> {
             image::print_status(opts.profile.as_deref(), &opts.mounts).map(|_| ExitCode::SUCCESS)
         }
         Cmd::Clean => image::clean().map(|_| ExitCode::SUCCESS),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse(argv: &[&str]) -> Cli {
+        Cli::try_parse_from(std::iter::once("arbox").chain(argv.iter().copied()))
+            .unwrap_or_else(|e| panic!("{argv:?}: {e}"))
+    }
+
+    fn passthrough(cmd: Cmd) -> Vec<String> {
+        match cmd {
+            Cmd::Claude { args }
+            | Cmd::Codex { args }
+            | Cmd::Opencode { args }
+            | Cmd::Agy { args }
+            | Cmd::Grok { args }
+            | Cmd::Bash { args }
+            | Cmd::Playwright { args }
+            | Cmd::Wrangler { args } => args,
+            Cmd::Run { cmd } => cmd,
+            other => panic!("not a pass-through verb: {other:?}"),
+        }
+    }
+
+    /// The contract: arbox options before the verb, and everything after the
+    /// verb — flags, `--help`, arbox's own option names — belongs to the verb.
+    #[test]
+    fn options_before_verb_and_verbatim_after() {
+        let cli = parse(&["--voice", "--mount-codex", "claude", "--resume", "--voice"]);
+        assert!(cli.voice);
+        assert!(cli.mount_codex);
+        assert_eq!(passthrough(cli.cmd), ["--resume", "--voice"]);
+
+        // An arbox option after the verb is NOT an arbox option any more.
+        let cli = parse(&["claude", "--voice"]);
+        assert!(!cli.voice);
+        assert_eq!(passthrough(cli.cmd), ["--voice"]);
+
+        // `--help` after a pass-through verb goes to the tool, not to clap.
+        assert_eq!(passthrough(parse(&["claude", "--help"]).cmd), ["--help"]);
+        assert_eq!(
+            passthrough(parse(&["bash", "-c", "cargo test"]).cmd),
+            ["-c", "cargo test"]
+        );
+        assert_eq!(
+            passthrough(parse(&["run", "cargo", "test", "--", "--nocapture"]).cmd),
+            ["cargo", "test", "--", "--nocapture"]
+        );
+    }
+
+    /// A leading `--` right after the verb is still accepted (older docs and
+    /// scripts use it) and is swallowed by clap rather than forwarded.
+    #[test]
+    fn leading_double_dash_still_works() {
+        assert_eq!(
+            passthrough(parse(&["run", "--", "cargo", "test"]).cmd),
+            ["cargo", "test"]
+        );
+        assert_eq!(
+            passthrough(parse(&["claude", "--", "--resume"]).cmd),
+            ["--resume"]
+        );
+    }
+
+    /// Top-level help and the non-pass-through verbs keep clap's own help.
+    #[test]
+    fn arbox_help_still_reachable() {
+        use clap::error::ErrorKind;
+        for argv in [
+            vec!["--help"],
+            vec!["update", "--help"],
+            vec!["status", "-h"],
+        ] {
+            let err = Cli::try_parse_from(std::iter::once("arbox").chain(argv.iter().copied()))
+                .expect_err("help should short-circuit");
+            assert_eq!(err.kind(), ErrorKind::DisplayHelp, "{argv:?}");
+        }
+        let cli = parse(&["update", "--force"]);
+        assert!(matches!(cli.cmd, Cmd::Update { force: true }));
     }
 }

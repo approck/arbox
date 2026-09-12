@@ -625,7 +625,7 @@ pub fn run_claude(extra: Vec<String>, opts: Opts) -> Result<ExitCode> {
     let mut injected = vec!["--dangerously-skip-permissions"];
     if opts.voice {
         // Injected ahead of the user's trailing args, so an explicit
-        // `arbox claude --voice -- --settings ...` still wins.
+        // `arbox --voice claude --settings ...` still wins.
         injected.extend(["--settings", CLAUDE_VOICE_SETTINGS]);
     }
     run_agent("claude", &injected, extra, opts)
@@ -707,22 +707,19 @@ pub fn run_wrangler(extra: Vec<String>, opts: Opts) -> Result<ExitCode> {
     run(host, argv, opts, &sel)
 }
 
-pub fn run_bash(opts: Opts) -> Result<ExitCode> {
+pub fn run_bash(extra: Vec<String>, opts: Opts) -> Result<ExitCode> {
     let host = host::detect()?;
     host::require_git(&host)?;
     // Nothing by default. Launching an agent from this shell means asking for
-    // its state explicitly: `arbox bash --mount-claude`. Without that, the
+    // its state explicitly: `arbox --mount-claude bash`. Without that, the
     // agent starts unauthenticated and writes throwaway state inside the
     // container, which is the intended shape — the shell is not a blanket
     // grant of every credential you own.
     let sel = select(&[], false, &opts.mounts);
     ensure_state(&host, &sel, opts.profile.as_deref())?;
-    run(
-        host,
-        vec!["/bin/bash".to_string(), "-l".to_string()],
-        opts,
-        &sel,
-    )
+    let mut argv = vec!["/bin/bash".to_string(), "-l".to_string()];
+    argv.extend(extra);
+    run(host, argv, opts, &sel)
 }
 
 pub fn run_argv(argv: Vec<String>, opts: Opts) -> Result<ExitCode> {

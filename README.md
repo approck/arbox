@@ -173,7 +173,7 @@ cd ~/code/some-rust-project
 arbox status                       # inspect detected host facts and mounts
 arbox update                       # refresh agents to latest; auto-builds if missing
 arbox bash                         # interactive bash, project auto-mounted
-arbox run -- cargo test            # one-off command
+arbox run cargo test               # one-off command
 arbox claude                       # Claude Code, project auto-mounted
 arbox codex                        # Codex CLI, project auto-mounted
 arbox opencode                     # OpenCode TUI (local Ollama works on Linux)
@@ -200,19 +200,32 @@ clear message.
 
 | Command                         | Description |
 |---------------------------------|-------------|
-| `arbox claude [FLAGS] -- ARGS...` | Run Claude Code with `--dangerously-skip-permissions`. Binary baked into image; `~/.claude` + `~/.claude.json` mount from the host, and no other agent's state does. With `--voice`, starts with voice mode already enabled. |
-| `arbox codex  [FLAGS] -- ARGS...` | Run Codex CLI with `--dangerously-bypass-approvals-and-sandbox`. Binary baked into image; `~/.codex` mounts from the host, and no other agent's state does. |
-| `arbox opencode [FLAGS] -- ARGS...` | Run the OpenCode TUI. Binary baked into image; `~/.config/opencode` (config) and `~/.local/share/opencode` (auth in `auth.json`, sessions) mount from the host, and no other agent's state does. Host-local providers like Ollama on `localhost:11434` work via host networking on Linux; on Windows and macOS, Docker Desktop reaches them only with its opt-in host-networking feature enabled. |
-| `arbox agy    [FLAGS] -- ARGS...` | Run Google Antigravity's `agy` CLI. Binary baked into image; `~/.gemini` and `~/.config/antigravity` mount from the host, and no other agent's state does. First-time auth uses agy's SSH-style URL+code flow since libsecret isn't reachable inside the container. |
-| `arbox grok   [FLAGS] -- ARGS...` | Run xAI's Grok Build CLI. Binary baked into image; `~/.grok` mounts from the host (token lives in `~/.grok/auth.json`), and no other agent's state does. |
-| `arbox bash   [FLAGS]`          | Open an interactive login bash inside the container. No agent state is mounted — add `--mount-<agent>` to run one from the shell. |
-| `arbox playwright [FLAGS] -- ARGS...` | Run the Playwright CLI (`test`, `codegen`, `show-report`, …). Image ships Node + Playwright + chromium + firefox. No agent state is mounted. |
-| `arbox wrangler [FLAGS] -- ARGS...` | Run the Cloudflare Workers CLI (`dev`, `deploy`, `d1`, …) from the image, so the host needs neither node nor wrangler. The only verb that mounts wrangler's config dir, so your `wrangler login` carries over. |
-| `arbox run    [FLAGS] -- CMD...`  | Run a one-off command inside the container. No agent state is mounted. |
+| `arbox [OPTIONS] claude ARGS...` | Run Claude Code with `--dangerously-skip-permissions`. Binary baked into image; `~/.claude` + `~/.claude.json` mount from the host, and no other agent's state does. With `--voice`, starts with voice mode already enabled. |
+| `arbox [OPTIONS] codex ARGS...` | Run Codex CLI with `--dangerously-bypass-approvals-and-sandbox`. Binary baked into image; `~/.codex` mounts from the host, and no other agent's state does. |
+| `arbox [OPTIONS] opencode ARGS...` | Run the OpenCode TUI. Binary baked into image; `~/.config/opencode` (config) and `~/.local/share/opencode` (auth in `auth.json`, sessions) mount from the host, and no other agent's state does. Host-local providers like Ollama on `localhost:11434` work via host networking on Linux; on Windows and macOS, Docker Desktop reaches them only with its opt-in host-networking feature enabled. |
+| `arbox [OPTIONS] agy ARGS...`   | Run Google Antigravity's `agy` CLI. Binary baked into image; `~/.gemini` and `~/.config/antigravity` mount from the host, and no other agent's state does. First-time auth uses agy's SSH-style URL+code flow since libsecret isn't reachable inside the container. |
+| `arbox [OPTIONS] grok ARGS...`  | Run xAI's Grok Build CLI. Binary baked into image; `~/.grok` mounts from the host (token lives in `~/.grok/auth.json`), and no other agent's state does. |
+| `arbox [OPTIONS] bash ARGS...`  | Open an interactive login bash inside the container (args go to `bash -l`, so `arbox bash -c 'cargo test'` works). No agent state is mounted — add `--mount-<agent>` before the verb to run one from the shell. |
+| `arbox [OPTIONS] playwright ARGS...` | Run the Playwright CLI (`test`, `codegen`, `show-report`, …). Image ships Node + Playwright + chromium + firefox. No agent state is mounted. |
+| `arbox [OPTIONS] wrangler ARGS...` | Run the Cloudflare Workers CLI (`dev`, `deploy`, `d1`, …) from the image, so the host needs neither node nor wrangler. The only verb that mounts wrangler's config dir, so your `wrangler login` carries over. |
+| `arbox [OPTIONS] run CMD...`    | Run a one-off command inside the container. No agent state is mounted. |
 | `arbox update`                  | Refresh the baked-in agents (claude, codex, opencode, agy, grok) to their latest published versions, rebuilding only the agent layers (quick — the apt/node/playwright layers stay cached). Builds the image from scratch if it doesn't exist yet. |
 | `arbox update --force`          | Full clean rebuild of the entire image (`--no-cache`): re-runs apt, node, the Playwright browser downloads, everything. |
 | `arbox status`                  | Show host facts, mount layout, image presence, network mode, whether the wrangler config dir is bound, and detected host audio and USB serial devices. Works outside a git repository (skips the workspace mount in that case). |
 | `arbox clean`                   | Remove every arbox image whose tag has the current host's prefix. |
+
+**arbox options go before the verb. Everything after the verb belongs to the
+verb**, verbatim — arbox parses none of it, not even `--help`:
+
+```bash
+arbox --voice --mount-codex claude --resume  # --voice/--mount-codex are arbox's; --resume is claude's
+arbox claude --help                          # claude's help, not arbox's
+arbox --rw ~/scratch run cargo test          # the `--` of older docs is still accepted
+```
+
+The flip side: an arbox option written after the verb is handed to the tool
+(`arbox claude --voice` starts claude with a `--voice` argument it doesn't
+know). `arbox --help` lists every option.
 
 `claude`, `codex`, `opencode`, `agy`, `grok`, `playwright`, `wrangler`,
 `bash`, and `run` must be invoked from inside a git repository — they mount the git toplevel as
@@ -221,16 +234,15 @@ the workspace and `cd` into your current directory. `status`, `update`, and
 
 ### Extra bind-mount flags
 
-`claude`, `codex`, `opencode`, `agy`, `grok`, `playwright`, `wrangler`,
-`bash`, and `run` accept zero or more `--rw <PATH>` and
-`--ro <PATH>` options. Each path is canonicalized (relative paths and
-symlinks resolve against the host filesystem) and mounted at the same
-absolute path inside the container.
+Every launch verb accepts zero or more `--rw <PATH>` and `--ro <PATH>`
+options ahead of it. Each path is canonicalized (relative paths and symlinks
+resolve against the host filesystem) and mounted at the same absolute path
+inside the container.
 
 ```bash
-arbox bash --rw ~/scratch
-arbox run --rw /tmp/build-out --ro /opt/data -- cargo build
-arbox claude --rw ~/code/sibling-repo --ro ~/datasets/fixtures
+arbox --rw ~/scratch bash
+arbox --rw /tmp/build-out --ro /opt/data run cargo build
+arbox --rw ~/code/sibling-repo --ro ~/datasets/fixtures claude
 ```
 
 Required to exist on the host; launches fail loudly if a path is missing.
@@ -254,15 +266,15 @@ So `arbox codex` cannot read your Claude credentials, plans, or session
 history; `arbox claude` holds no Cloudflare token; and `arbox playwright test`
 holds nothing at all. This is the default; nothing is needed to get it.
 
-Two global flags override it in either direction, on any verb:
+Two options override it in either direction, on any verb:
 
 ```bash
-arbox bash --mount-claude                  # shell that can run claude
-arbox bash --mount-claude --mount-codex    # …or either of two
-arbox claude --no-mount-claude             # claude with throwaway state
-arbox run --mount-grok -- grok "summarize this diff"
-arbox bash --mount-wrangler                # shell that can deploy
-arbox wrangler --no-mount-wrangler dev     # local dev, no credential in the box
+arbox --mount-claude bash                  # shell that can run claude
+arbox --mount-claude --mount-codex bash    # …or either of two
+arbox --no-mount-claude claude             # claude with throwaway state
+arbox --mount-grok run grok "summarize this diff"
+arbox --mount-wrangler bash                # shell that can deploy
+arbox --no-mount-wrangler wrangler dev     # local dev, no credential in the box
 ```
 
 `--mount-<name>` adds that state whatever the verb's default;
@@ -299,14 +311,14 @@ state mounts:
 
 ### Audio (`--voice`)
 
-No sound reaches the container by default. Pass `--voice` (global, on any
-launch verb) to bind the host's audio hardware in — needed for microphone
-input, for TTS playback, and for media tests:
+No sound reaches the container by default. Pass `--voice` (before any launch
+verb) to bind the host's audio hardware in — needed for microphone input, for
+TTS playback, and for media tests:
 
 ```bash
-arbox claude --voice          # voice mode already on; hold space to talk
-arbox bash --voice            # then: rec /tmp/t.wav trim 0 3 && play /tmp/t.wav
-arbox --voice run -- pactl info
+arbox --voice claude          # voice mode already on; hold space to talk
+arbox --voice bash            # then: rec /tmp/t.wav trim 0 3 && play /tmp/t.wav
+arbox --voice run pactl info
 ```
 
 On `arbox claude` the flag also switches Claude Code's voice mode on for that
@@ -346,15 +358,15 @@ container on either platform.
 
 ### USB serial (`--serial`)
 
-No serial port reaches the container by default. Pass `--serial` (global, on
+No serial port reaches the container by default. Pass `--serial` (before
 any launch verb) to bind the host's USB serial devices in — what you need to
 flash and monitor a microcontroller dev board (ESP32, RP2040, STM32 Nucleo,
 Arduino…) from inside the sandbox:
 
 ```bash
-arbox bash --serial                          # every /dev/ttyUSB* + /dev/ttyACM*
-arbox claude --serial-dev /dev/ttyACM0       # just this one board
-arbox --serial-dev /dev/serial/by-id/usb-Espressif_USB_JTAG_serial_debug_unit_* run -- cargo run --release
+arbox --serial bash                          # every /dev/ttyUSB* + /dev/ttyACM*
+arbox --serial-dev /dev/ttyACM0 claude       # just this one board
+arbox --serial-dev /dev/serial/by-id/usb-Espressif_USB_JTAG_serial_debug_unit_* run cargo run --release
 ```
 
 `--serial` auto-detects and binds every `ttyUSB<n>` (CP210x / CH340 / FTDI
@@ -425,7 +437,7 @@ The compiler side is host work, because `~/.rustup` is mounted read-only:
 
 By default each agent uses its standard host location, so arbox shares your
 normal login, history, and memories with the host. Pass `--profile <NAME>`
-(global, on any launch verb) to run a *second* subscription concurrently under
+(before any launch verb) to run a *second* subscription concurrently under
 a fully self-contained state tree — handy when you want one box on your work
 plan and another on a personal plan at the same time.
 
@@ -459,7 +471,7 @@ that launch actually mounts (their dirs are made and
 attach); then `/login` inside that box populates it.
 
 ```bash
-arbox claude --profile personal          # first run: log in inside the box
+arbox --profile personal claude          # first run: log in inside the box
 arbox --profile personal claude --resume # resumes that profile's own sessions
 arbox --profile personal status          # show the redirected mounts
 ```
@@ -494,7 +506,7 @@ ID, no calls to Cloudflare. The same is true of `vitest` with
 
 ```bash
 arbox wrangler dev                        # local: workerd + simulated bindings
-arbox wrangler --no-mount-wrangler dev    # …and provably no credential in the box
+arbox --no-mount-wrangler wrangler dev    # …and provably no credential in the box
 ```
 
 Credentials are only needed for commands that touch your account —
